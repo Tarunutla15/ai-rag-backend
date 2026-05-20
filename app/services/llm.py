@@ -1,6 +1,6 @@
 """LLM service (OpenAI or Groq OpenAI-compatible API). Embeddings stay on OpenAI in embedding.py."""
 from openai import OpenAI
-from typing import List, Dict, Optional
+from typing import Iterator, List, Dict, Optional
 import json
 import logging
 import re
@@ -76,7 +76,9 @@ OTHER RULES:
   include that Markdown line verbatim in your answer so the app can display the image. Do not say the image is
   "not available" if `view_url` is present.
 
-DO NOT HALLUCINATE: only state what the retrieved text reasonably supports."""
+DO NOT HALLUCINATE: only state what the retrieved text reasonably supports.
+
+FORMATTING: Use compact Markdown — ## for section titles, short bullet lists, no extra blank lines between sections or list items."""
     
     def __init__(self, api_key: str, model: str = "gpt-3.5-turbo", base_url: Optional[str] = None):
         """
@@ -92,36 +94,29 @@ DO NOT HALLUCINATE: only state what the retrieved text reasonably supports."""
         self.model = model
         self.last_usage: Optional[Dict] = None
     
-    def generate_response(
+    def _build_rag_messages(
         self,
         query: str,
         context_chunks: List[Dict],
         chat_history: Optional[List[Dict]] = None,
         system_prompt: Optional[str] = None,
-        available_technologies: Optional[List[str]] = None
-    ) -> str:
-        """
-        Generate response using LLM with context from vector search and chat history.
-        
-        Args:
-            query: User query
-            context_chunks: List of relevant chunks from vector search
-            chat_history: Optional list of previous messages [{"role": "user/assistant", "content": "..."}]
-            system_prompt: Optional custom system prompt
-            available_technologies: Optional list of available technologies/courses in the system
-            
-        Returns:
-            LLM generated response
-        """
+        available_technologies: Optional[List[str]] = None,
+    ) -> List[Dict]:
+        """Build OpenAI-format messages for RAG completion (shared by sync + stream)."""
         if system_prompt is None:
             system_prompt = self.DEFAULT_SYSTEM_PROMPT
-        
-        # Build context from chunks - filter out empty chunks
-        valid_chunks = [chunk for chunk in context_chunks if chunk.get('text', '').strip()]
+
+        valid_chunks = [chunk for chunk in context_chunks if chunk.get("text", "").strip()]
         print(f">>> LLM: Processing {len(valid_chunks)} valid chunks (out of {len(context_chunks)} total)", flush=True)
-        
+
         if not valid_chunks:
-            return "I couldn't find any text content in the retrieved documents to answer your question."
+            return [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": "I couldn't find any text content in the retrieved documents to answer your question.",
+                },
+            ]
 
         valid_chunks = sorted(
             valid_chunks,
@@ -137,13 +132,12 @@ DO NOT HALLUCINATE: only state what the retrieved text reasonably supports."""
             max_per_chunk = max(500, int(getattr(settings, "GROQ_MAX_CHARS_PER_CHUNK", 3200)))
             max_history_chars = max(0, int(getattr(settings, "GROQ_MAX_CHAT_HISTORY_CHARS", 4000)))
 
-        # Extract technologies present in context
         technologies_in_context = set()
         for chunk in valid_chunks:
-            tech = chunk.get('technology', 'unknown')
-            if tech and tech != 'unknown' and tech != 'general':
+            tech = chunk.get("technology", "unknown")
+            if tech and tech != "unknown" and tech != "general":
                 technologies_in_context.add(tech)
-        
+
         def _format_raw_table(raw_table: Dict) -> str:
             if not raw_table:
                 return ""
@@ -222,38 +216,22 @@ DO NOT HALLUCINATE: only state what the retrieved text reasonably supports."""
         context = "\n\n".join(context_parts)
         if max_context_chars is not None and len(context_parts) < len(valid_chunks):
             context += "\n\n[Note: additional retrieved excerpts were omitted to fit the model provider token limits.]"
-        
-        # Debug: Log context length
+
         print(f">>> LLM: Total context length: {len(context)} characters", flush=True)
         print(f">>> LLM: Technologies in context: {technologies_in_context}", flush=True)
-        print(f">>> LLM: Context preview: {context[:300]}...", flush=True)
-        
-        # Build messages array with proper structure:
-        # 1. System prompt
-        # 2. Chat history (if any)
-        # 3. Retrieved context + current question
-        
+
         messages = [{"role": "system", "content": system_prompt}]
-        
-        # Add chat history if provided (excluding the current query which we'll add with context)
         history_src = chat_history or []
         if max_history_chars is not None and history_src:
             history_src = _trim_chat_history_for_budget(list(history_src), max_history_chars)
         if history_src:
             print(f">>> LLM: Including {len(history_src)} messages from chat history", flush=True)
             for msg in history_src:
-                # Skip if this is the current query (we'll add it with context)
                 if msg["role"] == "user" and msg["content"].strip() == query.strip():
                     continue
-                messages.append({
-                    "role": msg["role"],
-                    "content": msg["content"]
-                })
-        
-        # Add current query with retrieved context - STRICT MODE WITH HELPFUL GUIDANCE
+                messages.append({"role": msg["role"], "content": msg["content"]})
+
         tech_list = ", ".join(sorted(technologies_in_context)) if technologies_in_context else "general/unknown"
-        
-        # Course-level labels from ingest — orientation only; subtopics (modules, classes, …) are still valid.
         library_labels_text = ""
         if available_technologies and len(available_technologies) > 0:
             library_labels_text = f"""
@@ -272,35 +250,27 @@ QUESTION: {query}
 
 Instructions:
 1. Read ALL excerpts. Noisy or fragmented PDF text still counts—extract whatever clearly relates to the question.
-2. If any excerpt or raw block discusses the topic (e.g. scope: global/local/nonlocal/namespace/LEGB; modules: import/from/__name__/packages), answer from that material with clear structure (definitions + bullets + short examples taken from context).
-3. Do NOT say "context does not contain" or "ask about Python" when the tag is python and the question is a normal Python subtopic—unless the snippets truly have zero relevant content.
+2. If any excerpt or raw block discusses the topic, answer with compact Markdown (## sections, tight bullets, no extra blank lines).
+3. Do NOT say "context does not contain" when the tag matches the course and snippets relate to the question.
 4. Say you cannot answer from the documents ONLY if nothing in the retrieved text bears on the question.
 5. Do not add facts from training data that are not supported by the excerpts.
 
-Write the best answer the retrieved text allows."""
-        
-        messages.append({
-            "role": "user",
-            "content": user_prompt
-        })
-        
-        # Debug: Log message structure
+Write the best compact answer the retrieved text allows."""
+
+        messages.append({"role": "user", "content": user_prompt})
         print(f">>> LLM: Total messages being sent to LLM: {len(messages)}", flush=True)
-        
+        return messages
+
+    def _completion_max_tokens(self) -> int:
         completion_max = 900
         if _is_groq_provider():
             completion_max = min(completion_max, 768)
+        return completion_max
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=0.3,  # Lower temperature for more deterministic, context-focused responses
-            max_tokens=completion_max,
-        )
+    def _capture_usage(self, response) -> None:
         try:
             usage = getattr(response, "usage", None)
             if usage:
-                # prompt_tokens / completion_tokens / total_tokens (OpenAI-compatible)
                 self.last_usage = {
                     "prompt_tokens": getattr(usage, "prompt_tokens", None),
                     "completion_tokens": getattr(usage, "completion_tokens", None),
@@ -311,7 +281,64 @@ Write the best answer the retrieved text allows."""
         except Exception:
             self.last_usage = None
 
-        return response.choices[0].message.content.strip()
+    def generate_response(
+        self,
+        query: str,
+        context_chunks: List[Dict],
+        chat_history: Optional[List[Dict]] = None,
+        system_prompt: Optional[str] = None,
+        available_technologies: Optional[List[str]] = None,
+    ) -> str:
+        """Generate response using LLM with context from vector search and chat history."""
+        messages = self._build_rag_messages(
+            query, context_chunks, chat_history, system_prompt, available_technologies
+        )
+        if len(messages) == 2 and messages[1].get("role") == "user" and "couldn't find any text" in (messages[1].get("content") or ""):
+            return messages[1]["content"]
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=self._completion_max_tokens(),
+        )
+        self._capture_usage(response)
+        return (response.choices[0].message.content or "").strip()
+
+    def stream_response(
+        self,
+        query: str,
+        context_chunks: List[Dict],
+        chat_history: Optional[List[Dict]] = None,
+        system_prompt: Optional[str] = None,
+        available_technologies: Optional[List[str]] = None,
+    ) -> Iterator[str]:
+        """Yield completion text deltas for SSE streaming."""
+        messages = self._build_rag_messages(
+            query, context_chunks, chat_history, system_prompt, available_technologies
+        )
+        if len(messages) == 2 and messages[1].get("role") == "user" and "couldn't find any text" in (messages[1].get("content") or ""):
+            yield messages[1]["content"]
+            self.last_usage = None
+            return
+
+        stream = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=self._completion_max_tokens(),
+            stream=True,
+        )
+        self.last_usage = None
+        for chunk in stream:
+            if getattr(chunk, "usage", None):
+                self._capture_usage(chunk)
+            choice = chunk.choices[0] if chunk.choices else None
+            if not choice:
+                continue
+            delta = getattr(choice.delta, "content", None) if choice.delta else None
+            if delta:
+                yield delta
     
     def generate_response_simple(
         self,

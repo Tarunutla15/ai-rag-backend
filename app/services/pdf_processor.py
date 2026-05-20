@@ -201,6 +201,7 @@ class PDFProcessor:
 
         blocks: List[Dict] = []
         current_section_title = ""
+        last_text_block_id_by_page: Dict[int, str] = {}
 
         with pdfplumber.open(pdf_path) as pdf:
             for page_index, page in enumerate(pdf.pages, start=1):
@@ -251,6 +252,8 @@ class PDFProcessor:
                                     "page_number": page_index,
                                     "section_title": current_section_title,
                                 })
+                                if current_type == "text":
+                                    last_text_block_id_by_page[page_index] = block_id
                         current_type = line_type
                         buffer = [line]
 
@@ -274,6 +277,8 @@ class PDFProcessor:
                                 "page_number": page_index,
                                 "section_title": current_section_title,
                             })
+                            if (current_type or "text") == "text":
+                                last_text_block_id_by_page[page_index] = block_id
 
                 # Extract tables
                 try:
@@ -310,14 +315,18 @@ class PDFProcessor:
                     if nearby:
                         parts.append(f"Text on the same page (may label or describe this figure): {nearby}")
                     image_content = " ".join(parts)
-                    blocks.append({
+                    img_block: Dict = {
                         "block_id": block_id,
                         "block_type": "image",
                         "content": image_content,
                         "image_meta": img,
                         "page_number": page_index,
                         "section_title": current_section_title,
-                    })
+                    }
+                    ctx_bid = last_text_block_id_by_page.get(page_index)
+                    if ctx_bid:
+                        img_block["page_context_block_id"] = ctx_bid
+                    blocks.append(img_block)
 
         # Merge adjacent code blocks on the same page (e.g. split only by a blank line inside a function)
         merged: List[Dict] = []

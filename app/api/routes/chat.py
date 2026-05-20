@@ -1,9 +1,12 @@
 """Chat API route - RAG Q&A with session and context."""
+import asyncio
 import logging
+import re
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 from app.config import settings, get_completion_client_config
@@ -74,6 +77,35 @@ def _get_previous_user_message(recent_messages: list) -> str:
     return ""
 
 
+def _technologies_from_scoped_documents(scope_file_ids: list) -> tuple:
+    """
+    Derive retrieval technology/domain from ingested document metadata when the user
+    scoped the chat to specific PDFs. Avoids LLM returning java,python,js for generic
+    questions like "what is a function" while only Python_Notes.pdf is in scope.
+    """
+    if not scope_file_ids:
+        return [], None
+    store = get_document_store()
+    techs: list = []
+    domains: list = []
+    for did in scope_file_ids:
+        doc = store.get_document(did)
+        if not doc:
+            continue
+        t = (doc.get("technology") or "").strip().lower()
+        d = (doc.get("domain") or "").strip().lower()
+        if t and t not in techs:
+            techs.append(t)
+        if d and d not in domains:
+            domains.append(d)
+    if not techs:
+        return [], None
+    domain = domains[0] if len(domains) == 1 else None
+    if len(techs) == 1 and not domain:
+        domain = QueryClassifier.TECHNOLOGY_TO_DOMAIN.get(techs[0])
+    return techs, domain
+
+
 def _get_last_user_message_with_tech(recent_messages: list) -> tuple:
     """
     Return (text, technologies, domain) for the most recent user message that yields a tech.
@@ -93,30 +125,245 @@ def _get_last_user_message_with_tech(recent_messages: list) -> tuple:
     return "", [], None
 
 
+_FOLLOWUP_PRONOUN_RE = re.compile(
+    r"\b(it|this|that|those|them|same|more|above|earlier|previous)\b",
+    re.IGNORECASE,
+)
+_QUERY_STOPWORDS = frozenset({
+    "what", "are", "is", "was", "the", "a", "an", "and", "or", "give", "some", "how",
+    "to", "in", "of", "for", "with", "about", "explain", "tell", "me", "can", "you",
+    "depth", "examples", "example", "please",
+    # Filler adjectives / common typos (e.g. "nad" for "and") — not useful for ILIKE or section boost
+    "good", "best", "great", "nice", "very", "really", "just", "also", "nad", "adn", "nd",
+})
+_TECH_NAME_STOPWORDS = frozenset(QueryClassifier.TECHNOLOGY_TO_DOMAIN.keys())
+
+
+def _is_short_follow_up(query: str) -> bool:
+    q = (query or "").strip()
+    if not q:
+        return False
+    if len(q) <= 48 and _FOLLOWUP_PRONOUN_RE.search(q):
+        return True
+    return len(q) <= 28
+
+
+def _topic_terms(query: str, technologies: Optional[List[str]] = None) -> list:
+    """Content terms for section boost / keyword focus (exclude tech names and stopwords)."""
+    exclude = set(_QUERY_STOPWORDS)
+    exclude |= _TECH_NAME_STOPWORDS
+    if technologies:
+        exclude |= {t.lower() for t in technologies}
+    tokens = re.findall(r"[A-Za-z0-9_]+", query or "")
+    out: list = []
+    for t in tokens:
+        low = t.lower()
+        if len(low) < 3 or low in exclude:
+            continue
+        if low.endswith("s") and len(low) > 4 and low[:-1] not in exclude:
+            out.append(low[:-1])
+        out.append(low)
+    seen: set = set()
+    deduped: list = []
+    for t in out:
+        if t not in seen:
+            seen.add(t)
+            deduped.append(t)
+    return deduped[:8]
+
+
 def _build_search_query(
     query: str,
     technologies: list,
-    from_context: bool,
+    from_conversation_context: bool,
     recent_messages: list,
     topic_context_text: str = "",
+    *,
+    from_scoped_documents: bool = False,
 ) -> str:
-    """Build search query, optionally using previous user message and tech bias."""
+    """
+    Build the string used for vector embeddings.
+
+    - Scoped PDFs: do not prepend technology (document_id filter already applies).
+    - Conversation-inferred scope: prepend technology slugs to bias embedding.
+    - Short pronoun follow-ups: stitch prior user turn so "it" resolves to the topic.
+    """
     base = query.strip()
-    # Only stitch the previous user turn into the embedding for short follow-ups
-    # ("what about X?", "and Y?"). Long questions stay standalone so unrelated prior
-    # chats do not dilute retrieval (e.g. "web frameworks" before "Module basics").
-    if from_context and len(base) <= 36:
-        prev_user = topic_context_text or _get_previous_user_message(recent_messages)
-        if prev_user:
-            base = f"{prev_user} {base}".strip()
-    if from_context and technologies:
+    if from_conversation_context or from_scoped_documents:
+        if _is_short_follow_up(base):
+            prev_user = topic_context_text or _get_previous_user_message(recent_messages)
+            if prev_user:
+                base = f"{prev_user} {base}".strip()
+    if from_conversation_context and technologies and not from_scoped_documents:
         return (" ".join(technologies) + " " + base).strip()
     return base
+
+
+def _build_keyword_query(
+    query: str,
+    recent_messages: list,
+    technologies: list | None,
+    *,
+    from_scoped_documents: bool = False,
+) -> str:
+    """Keyword ILIKE tokens — never prepend technology when the PDF is already scoped."""
+    base = query.strip()
+    if _is_short_follow_up(base):
+        prev_user = _get_previous_user_message(recent_messages)
+        if prev_user:
+            base = f"{prev_user} {base}".strip()
+    return base
+
+
+def _build_rerank_query(query: str, recent_messages: list) -> str:
+    """Reranker should see the full topic on pronoun follow-ups."""
+    base = query.strip()
+    if _is_short_follow_up(base):
+        prev_user = _get_previous_user_message(recent_messages)
+        if prev_user:
+            return f"{prev_user} {base}".strip()
+    return base
+
+
+def _looks_like_toc_excerpt(text: str) -> bool:
+    t = (text or "")[:2500]
+    if "Introduction to Python" in t and ("What is Python?" in t or "Download and Install" in t):
+        return True
+    dotted = len(re.findall(r"\b\w+\s+\d{1,3}\s*$", t, re.MULTILINE))
+    return dotted >= 6
+
+
+def _apply_retrieval_relevance_tuning(chunks: list, topic_terms: list) -> list:
+    """Boost on-topic sections; down-rank table-of-contents style excerpts."""
+    if not chunks:
+        return chunks
+    for c in chunks:
+        score = float(c.get("hybrid_score", c.get("score", 0.0)) or 0.0)
+        title = (c.get("section_title") or "").lower()
+        text = (c.get("text") or "").lower()
+        if topic_terms:
+            hits = sum(
+                1 for term in topic_terms
+                if term in title or term in text or f"{term}s" in text
+            )
+            if hits:
+                score += 0.14 * hits
+        if _looks_like_toc_excerpt(c.get("text") or ""):
+            score *= 0.45
+        c["hybrid_score"] = score
+        c["score"] = score
+    chunks.sort(key=lambda x: x.get("hybrid_score", 0.0), reverse=True)
+    return chunks
+
+
+def _cap_scope_document_ids(scope_file_ids: list) -> list:
+    """Limit in-filter document count for Zilliz/Supabase."""
+    ids = [str(d).strip() for d in (scope_file_ids or []) if d and str(d).strip()]
+    max_docs = int(getattr(settings, "CHAT_SCOPED_POOL_MAX_DOCUMENTS", 40))
+    if len(ids) > max_docs:
+        logger.warning(
+            ">>> RETRIEVAL: scope has %s documents; capping pooled search to %s",
+            len(ids),
+            max_docs,
+        )
+        return ids[:max_docs]
+    return ids
+
+
+async def _retrieve_scoped_document_pool_async(
+    *,
+    search_query: str,
+    keyword_query: str,
+    rerank_query: str,
+    scope_file_ids: list,
+    vector_store,
+    embedding_service: EmbeddingService,
+    keyword_service,
+    enable_keyword: bool,
+    keyword_top_k: int,
+    vector_weight: float,
+    keyword_weight: float,
+    enable_reranker: bool,
+    initial_top_k: int,
+    rerank_top_n: int,
+    topic_terms: Optional[List[str]] = None,
+) -> list:
+    """
+    One hybrid retrieval pass over the user's scoped document IDs (async I/O).
+
+    Embedding runs first; vector (3 Zilliz buckets in parallel) and keyword FTS run concurrently.
+    """
+    doc_ids = _cap_scope_document_ids(scope_file_ids)
+    if not doc_ids:
+        return []
+
+    query_embedding = await embedding_service.generate_embedding_async(search_query)
+    logger.info(
+        ">>> RETRIEVAL (async): scoped pool search docs=%s top_k=%s",
+        len(doc_ids),
+        initial_top_k,
+    )
+
+    vector_coro = vector_store.search_async(
+        query_embedding=query_embedding,
+        top_k=initial_top_k,
+        technology=None,
+        domain=None,
+        document_ids=doc_ids,
+        query_text=search_query,
+    )
+    if enable_keyword and keyword_service:
+        keyword_coro = asyncio.to_thread(
+            keyword_service.search,
+            query=keyword_query,
+            top_k=keyword_top_k,
+            technology=None,
+            domain=None,
+            document_ids=doc_ids,
+        )
+        vector_results, keyword_results = await asyncio.gather(vector_coro, keyword_coro)
+    else:
+        vector_results = await vector_coro
+        keyword_results = []
+
+    merged = _merge_hybrid_results(vector_results, keyword_results, vector_weight, keyword_weight)
+    merged = _apply_retrieval_relevance_tuning(merged, topic_terms or [])
+
+    if not merged:
+        logger.info(">>> RETRIEVAL: scoped pool returned 0 chunks for docs=%s", len(doc_ids))
+        return []
+
+    contributing = len({c.get("document_id") for c in merged if c.get("document_id")})
+    logger.info(
+        ">>> RETRIEVAL: scoped pool vector=%s keyword=%s merged=%s contributing_docs=%s/%s",
+        len(vector_results),
+        len(keyword_results),
+        len(merged),
+        contributing,
+        len(doc_ids),
+    )
+
+    if enable_reranker and len(merged) > rerank_top_n:
+        logger.info(">>> RERANK: scoped pool input_chunks=%s -> top_n=%s", len(merged), rerank_top_n)
+        reranker = get_reranker_service()
+        merged = await asyncio.to_thread(
+            reranker.rerank,
+            query=rerank_query,
+            chunks=merged,
+            top_n=rerank_top_n,
+        )
+        logger.info(">>> RERANK: scoped pool output_chunks=%s", len(merged))
+    elif len(merged) > rerank_top_n:
+        merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        merged = merged[:rerank_top_n]
+
+    return merged
 
 
 def _retrieve_context_chunks(
     *,
     search_query: str,
+    keyword_query: str,
     rerank_query: str,
     technologies: list,
     domain: str,
@@ -132,6 +379,7 @@ def _retrieve_context_chunks(
     initial_top_k: int,
     rerank_top_n: int,
     max_chunks_no_rerank: int,
+    topic_terms: Optional[List[str]] = None,
 ) -> list:
     """
     Retrieve and (optionally) rerank context chunks.
@@ -163,7 +411,7 @@ def _retrieve_context_chunks(
             kr = []
             if enable_keyword and keyword_service:
                 kr = keyword_service.search(
-                    query=search_query,
+                    query=keyword_query,
                     top_k=keyword_top_k,
                     technology=tech,
                     domain=dom,
@@ -213,7 +461,7 @@ def _retrieve_context_chunks(
             kr_w = []
             if enable_keyword and keyword_service:
                 kr_w = keyword_service.search(
-                    query=search_query,
+                    query=keyword_query,
                     top_k=max(keyword_top_k, wide_top),
                     technology=None,
                     domain=None,
@@ -233,6 +481,7 @@ def _retrieve_context_chunks(
                     context_chunks = merged_wide[:rerank_top_n]
                 else:
                     context_chunks = merged_wide
+        context_chunks = _apply_retrieval_relevance_tuning(context_chunks, topic_terms or [])
         # One global rerank across technologies so ordering is not biased by tech loop order
         if enable_reranker and reranker and len(context_chunks) > rerank_top_n:
             context_chunks = reranker.rerank(
@@ -265,7 +514,7 @@ def _retrieve_context_chunks(
     keyword_results = []
     if enable_keyword and keyword_service:
         keyword_results = keyword_service.search(
-            query=search_query,
+            query=keyword_query,
             top_k=keyword_top_k,
             technology=technology,
             domain=domain,
@@ -273,6 +522,7 @@ def _retrieve_context_chunks(
             file_id=request.file_id,
         )
     merged = _merge_hybrid_results(vector_results, keyword_results, vector_weight, keyword_weight)
+    merged = _apply_retrieval_relevance_tuning(merged, topic_terms or [])
     if not merged and scoped_doc and domain:
         vector_results = vector_store.search(
             query_embedding=query_embedding,
@@ -286,7 +536,7 @@ def _retrieve_context_chunks(
         keyword_results = []
         if enable_keyword and keyword_service:
             keyword_results = keyword_service.search(
-                query=search_query,
+                query=keyword_query,
                 top_k=keyword_top_k,
                 technology=technology,
                 domain=None,
@@ -294,6 +544,7 @@ def _retrieve_context_chunks(
                 file_id=request.file_id,
             )
         merged = _merge_hybrid_results(vector_results, keyword_results, vector_weight, keyword_weight)
+        merged = _apply_retrieval_relevance_tuning(merged, topic_terms or [])
         if merged:
             logger.info(">>> RETRIEVAL: single-scope fallback omit domain filter (scoped doc)")
     if not merged and scoped_doc and technology:
@@ -313,7 +564,7 @@ def _retrieve_context_chunks(
         keyword_results = []
         if enable_keyword and keyword_service:
             keyword_results = keyword_service.search(
-                query=search_query,
+                query=keyword_query,
                 top_k=max(keyword_top_k, wide_top),
                 technology=None,
                 domain=None,
@@ -321,6 +572,7 @@ def _retrieve_context_chunks(
                 file_id=scoped_doc,
             )
         merged = _merge_hybrid_results(vector_results, keyword_results, vector_weight, keyword_weight)
+        merged = _apply_retrieval_relevance_tuning(merged, topic_terms or [])
         if merged:
             logger.info(">>> RETRIEVAL: single-scope document-wide search (technology labels mismatch ingest)")
     logger.info(
@@ -519,6 +771,40 @@ def _maybe_supplement_image_caption_chunks(
     return list(context_chunks) + added
 
 
+def _expand_context_graph(
+    context_chunks: list,
+    query: str = "",
+    scope_file_ids: Optional[list] = None,
+    technologies: Optional[list] = None,
+) -> list:
+    """Phase 4: prev/next, cross-type links, document_edges, token-budget pack."""
+    if not context_chunks:
+        return context_chunks
+    if not getattr(settings, "ENABLE_GRAPH_CONTEXT_EXPANSION", True):
+        return context_chunks
+    from app.services.graph_context_expansion import expand_context_graph
+
+    seeks_figure = _query_seeks_figure_or_image(query)
+    expanded = expand_context_graph(
+        context_chunks,
+        query=query,
+        max_hops=1,
+        query_seeks_figure=seeks_figure,
+    )
+    if seeks_figure:
+        has_figure = any(
+            (c.get("chunk_type") or "").lower() == "image_caption" for c in expanded
+        )
+        if not has_figure:
+            expanded = _maybe_supplement_image_caption_chunks(
+                expanded,
+                query,
+                scope_file_ids or [],
+                technologies or [],
+            )
+    return expanded
+
+
 def _hydrate_chunks(context_chunks: list) -> list:
     """
     Enrich chunks with metadata, chunk_type, and raw table/code/image content.
@@ -576,11 +862,22 @@ def _hydrate_chunks(context_chunks: list) -> list:
     return context_chunks
 
 
-@router.post("/", response_model=ChatResponse)
-async def chat(request: ChatRequest):
+def _sources_from_chunks(context_chunks: list) -> list:
+    sources = []
+    for c in context_chunks:
+        tech = c.get("technology") or c.get("file_name")
+        if tech and tech not in sources:
+            sources.append(tech if isinstance(tech, str) else str(tech))
+    return list(sources)[:10]
+
+
+def _sse_payload(obj: dict) -> str:
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+async def _rag_turn_async(request: ChatRequest) -> dict:
     """
-    RAG chat: classify query, search vectors, build context, call LLM.
-    Creates a new session if session_id is not provided.
+    Scope resolution, retrieval, hydration. Returns metadata for LLM (sync or stream).
     """
     query = (request.query or "").strip()
     if not query:
@@ -655,21 +952,36 @@ async def chat(request: ChatRequest):
     # Only record the user message after scope is valid (avoids orphan messages on 400).
     chat_service.add_message(session_id, "user", query)
 
-    # Classify query with conversation context (scope = technologies the question relates to)
+    # Classify query: prefer scoped document ingest metadata over LLM multi-tech guesses
     recent_messages = chat_service.get_context_messages(session_id, context_window=6)
-    technologies, domain, from_context = classify_query_with_context(query, recent_messages)
-    logger.info(
-        ">>> RETRIEVAL: query_classification technologies=%s domain=%s from_conversation_context=%s",
-        technologies, domain, from_context,
-    )
+    scoped_techs, scoped_domain = _technologies_from_scoped_documents(scope_file_ids)
+    from_scoped_documents = bool(scoped_techs)
+    if scoped_techs:
+        technologies, domain = scoped_techs, scoped_domain
+        from_conversation_context = False
+        # Retrieval uses document_id pool only; avoid multi-tech balanced loops per doc.
+        if len(technologies) > 1:
+            logger.info(
+                ">>> RETRIEVAL: scoped docs have mixed ingest tags %s — pool search ignores tech filter",
+                technologies,
+            )
+        logger.info(
+            ">>> RETRIEVAL: query_classification from_scoped_documents technologies=%s domain=%s docs=%s",
+            technologies, domain, len(scope_file_ids),
+        )
+    else:
+        technologies, domain, from_conversation_context = classify_query_with_context(query, recent_messages)
+        logger.info(
+            ">>> RETRIEVAL: query_classification technologies=%s domain=%s from_conversation_context=%s",
+            technologies, domain, from_conversation_context,
+        )
 
     # If context-based classification yields multiple technologies, try to narrow to the last user topic
     topic_context_text = ""
-    if from_context and (not technologies or len(technologies) > 1):
+    if from_conversation_context and (not technologies or len(technologies) > 1):
         prev_text, prev_techs, prev_domain = _get_last_user_message_with_tech(recent_messages)
         if prev_text and prev_techs:
             topic_context_text = prev_text
-            # Prefer a single clear previous topic if available
             technologies = prev_techs
             domain = prev_domain
             logger.info(
@@ -677,10 +989,33 @@ async def chat(request: ChatRequest):
                 technologies, domain, repr(prev_text[:80] + ("..." if len(prev_text) > 80 else "")),
             )
 
-    # Search query for embedding: when scope came from previous turn, prepend to bias retrieval
-    search_query = _build_search_query(query, technologies, from_context, recent_messages, topic_context_text)
-    if from_context and technologies:
-        logger.info(">>> RETRIEVAL: expanded search_query=%s", repr(search_query[:80] + ("..." if len(search_query) > 80 else "")))
+    topic_terms = _topic_terms(query, technologies)
+    if _is_short_follow_up(query):
+        prev_user = _get_previous_user_message(recent_messages)
+        if prev_user:
+            topic_terms = list(
+                dict.fromkeys(topic_terms + _topic_terms(prev_user, technologies))
+            )
+
+    search_query = _build_search_query(
+        query,
+        technologies,
+        from_conversation_context,
+        recent_messages,
+        topic_context_text,
+        from_scoped_documents=from_scoped_documents,
+    )
+    keyword_query = _build_keyword_query(
+        query, recent_messages, technologies, from_scoped_documents=from_scoped_documents
+    )
+    rerank_query = _build_rerank_query(query, recent_messages)
+    if search_query.strip() != query.strip():
+        logger.info(
+            ">>> RETRIEVAL: embedding_search_query=%s",
+            repr(search_query[:100] + ("..." if len(search_query) > 100 else "")),
+        )
+    if topic_terms:
+        logger.info(">>> RETRIEVAL: topic_terms=%s", topic_terms)
 
     keyword_service = get_keyword_search_service()
     enable_reranker = getattr(settings, "ENABLE_RERANKER", True)
@@ -706,68 +1041,48 @@ async def chat(request: ChatRequest):
     if vector_store is None or embedding_service is None:
         if not enable_keyword or keyword_service is None:
             raise HTTPException(status_code=503, detail="Retrieval is unavailable (vector DB down and keyword search disabled).")
-        # Keyword-only retrieval
-        technology = technologies[0] if technologies else None
-        # Multi-document scope: query each document separately and merge
         context_chunks = []
-        per_doc_k = max(1, rerank_top_n // max(1, len(scope_file_ids)))
-        for doc_id in scope_file_ids:
-            hits = keyword_service.search(
-                query=search_query,
-                top_k=per_doc_k,
-                technology=technology,
-                domain=domain,
-                document_id=doc_id,
-                file_id=doc_id,
+        doc_ids = _cap_scope_document_ids(scope_file_ids)
+        if keyword_service and doc_ids:
+            hits = await asyncio.to_thread(
+                keyword_service.search,
+                query=keyword_query,
+                top_k=keyword_top_k,
+                technology=None,
+                domain=None,
+                document_ids=doc_ids,
             )
-            context_chunks.extend(hits or [])
-        # Prefer best scores
-        context_chunks.sort(key=lambda x: x.get("score", 0.0))
-        context_chunks = context_chunks[:rerank_top_n]
-        logger.info(">>> RETRIEVAL: keyword-only scoped docs=%s context_chunks=%s", len(scope_file_ids), len(context_chunks))
+            context_chunks = _apply_retrieval_relevance_tuning(hits or [], topic_terms)
+            context_chunks.sort(key=lambda x: x.get("score", 0.0))
+            context_chunks = context_chunks[:rerank_top_n]
+        logger.info(
+            ">>> RETRIEVAL: keyword-only scoped pool docs=%s context_chunks=%s",
+            len(doc_ids),
+            len(context_chunks),
+        )
     else:
-        # Multi-document scope: retrieve per doc, then merge + rerank downstream.
-        all_chunks = []
-        # Allocate top_k per document to keep latency bounded.
-        per_doc_initial = max(5, int(initial_top_k / max(1, len(scope_file_ids))))
-        for doc_id in scope_file_ids:
-            # Make a shallow request-like object with file_id set for filtering
-            try:
-                scoped_request = request.model_copy(update={"file_id": doc_id, "file_ids": None})
-            except Exception:
-                scoped_request = request
-                scoped_request.file_id = doc_id  # best-effort
-            hits = _retrieve_context_chunks(
-                search_query=search_query,
-                rerank_query=query,
-                technologies=technologies,
-                domain=domain,
-                request=scoped_request,
-                vector_store=vector_store,
-                embedding_service=embedding_service,
-                keyword_service=keyword_service,
-                enable_keyword=enable_keyword,
-                keyword_top_k=max(3, int(keyword_top_k / max(1, len(scope_file_ids)))),
-                vector_weight=vector_weight,
-                keyword_weight=keyword_weight,
-                enable_reranker=enable_reranker,
-                initial_top_k=per_doc_initial,
-                rerank_top_n=max(2, int(rerank_top_n / max(1, len(scope_file_ids)))),
-                max_chunks_no_rerank=max_chunks_no_rerank,
-            )
-            all_chunks.extend(hits or [])
-
-        # Merge duplicates and keep best hybrid_score
-        merged_map = {}
-        for c in all_chunks:
-            key = _chunk_key(c)
-            prev = merged_map.get(key)
-            if prev is None or c.get("score", 0.0) > prev.get("score", 0.0):
-                merged_map[key] = c
-        context_chunks = list(merged_map.values())
-        context_chunks.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-        context_chunks = context_chunks[:rerank_top_n]
-        logger.info(">>> RETRIEVAL: scoped docs=%s merged context_chunks=%s", len(scope_file_ids), len(context_chunks))
+        context_chunks = await _retrieve_scoped_document_pool_async(
+            search_query=search_query,
+            keyword_query=keyword_query,
+            rerank_query=rerank_query,
+            scope_file_ids=scope_file_ids,
+            vector_store=vector_store,
+            embedding_service=embedding_service,
+            keyword_service=keyword_service,
+            enable_keyword=enable_keyword,
+            keyword_top_k=keyword_top_k,
+            vector_weight=vector_weight,
+            keyword_weight=keyword_weight,
+            enable_reranker=enable_reranker,
+            initial_top_k=initial_top_k,
+            rerank_top_n=rerank_top_n,
+            topic_terms=topic_terms,
+        )
+        logger.info(
+            ">>> RETRIEVAL: scoped docs=%s final context_chunks=%s",
+            len(scope_file_ids),
+            len(context_chunks),
+        )
 
     # Self-refining retrieval loop (single retry with query rewrite)
     enable_query_rewrite = getattr(settings, "ENABLE_QUERY_REWRITE", True)
@@ -788,82 +1103,81 @@ async def chat(request: ChatRequest):
 
             if rewritten and rewritten.strip() and rewritten.strip() != query.strip():
                 rewrite_search_query = _build_search_query(
-                    rewritten, technologies, from_context, recent_messages, topic_context_text
+                    rewritten,
+                    technologies,
+                    from_conversation_context,
+                    recent_messages,
+                    topic_context_text,
+                    from_scoped_documents=from_scoped_documents,
                 )
+                rewrite_keyword_query = _build_keyword_query(
+                    rewritten,
+                    recent_messages,
+                    technologies,
+                    from_scoped_documents=from_scoped_documents,
+                )
+                rewrite_topic_terms = _topic_terms(rewritten, technologies)
                 logger.info(
                     ">>> RETRIEVAL: rewrite_query=%s",
                     repr(rewritten[:120] + ("..." if len(rewritten) > 120 else ""))
                 )
                 if vector_store is None or embedding_service is None:
-                    technology = technologies[0] if technologies else None
-                    per_doc_k_rw = max(1, rerank_top_n // max(1, len(scope_file_ids)))
-                    ctx_rw: list = []
-                    for doc_id in scope_file_ids:
-                        ctx_rw.extend(
-                            keyword_service.search(
-                                query=rewrite_search_query,
-                                top_k=per_doc_k_rw,
-                                technology=technology,
-                                domain=domain,
-                                document_id=doc_id,
-                                file_id=doc_id,
-                            )
-                            or []
+                    doc_ids_rw = _cap_scope_document_ids(scope_file_ids)
+                    ctx_rw = (
+                        await asyncio.to_thread(
+                            keyword_service.search,
+                            query=rewrite_keyword_query,
+                            top_k=keyword_top_k,
+                            technology=None,
+                            domain=None,
+                            document_ids=doc_ids_rw,
                         )
+                        if keyword_service
+                        else []
+                    )
+                    ctx_rw = _apply_retrieval_relevance_tuning(ctx_rw or [], rewrite_topic_terms)
                     ctx_rw.sort(key=lambda x: x.get("score", 0.0))
                     context_chunks = ctx_rw[:rerank_top_n]
-                    logger.info(">>> RETRIEVAL: keyword-only (rewritten) scoped docs=%s context_chunks=%s", len(scope_file_ids), len(context_chunks))
-                else:
-                    all_rewrite_chunks: list = []
-                    per_doc_initial_rw = max(5, int(initial_top_k / max(1, len(scope_file_ids))))
-                    rerank_n_rw = max(2, int(rerank_top_n / max(1, len(scope_file_ids))))
-                    for doc_id in scope_file_ids:
-                        try:
-                            scoped_rw = request.model_copy(update={"file_id": doc_id, "file_ids": None})
-                        except Exception:
-                            scoped_rw = request
-                            setattr(scoped_rw, "file_id", doc_id)
-                        hits_rw = _retrieve_context_chunks(
-                            search_query=rewrite_search_query,
-                            rerank_query=rewritten,
-                            technologies=technologies,
-                            domain=domain,
-                            request=scoped_rw,
-                            vector_store=vector_store,
-                            embedding_service=embedding_service,
-                            keyword_service=keyword_service,
-                            enable_keyword=enable_keyword,
-                            keyword_top_k=max(3, int(keyword_top_k / max(1, len(scope_file_ids)))),
-                            vector_weight=vector_weight,
-                            keyword_weight=keyword_weight,
-                            enable_reranker=enable_reranker,
-                            initial_top_k=per_doc_initial_rw,
-                            rerank_top_n=rerank_n_rw,
-                            max_chunks_no_rerank=max_chunks_no_rerank,
-                        )
-                        all_rewrite_chunks.extend(hits_rw or [])
-                    merged_rw: dict = {}
-                    for c in all_rewrite_chunks:
-                        key = _chunk_key(c)
-                        prev = merged_rw.get(key)
-                        if prev is None or c.get("score", 0.0) > prev.get("score", 0.0):
-                            merged_rw[key] = c
-                    context_chunks = list(merged_rw.values())
-                    context_chunks.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-                    context_chunks = context_chunks[:rerank_top_n]
                     logger.info(
-                        ">>> RETRIEVAL: rewrite merged scoped_docs=%s context_chunks=%s",
+                        ">>> RETRIEVAL: keyword-only rewrite pool docs=%s context_chunks=%s",
+                        len(doc_ids_rw),
+                        len(context_chunks),
+                    )
+                else:
+                    context_chunks = await _retrieve_scoped_document_pool_async(
+                        search_query=rewrite_search_query,
+                        keyword_query=rewrite_keyword_query,
+                        rerank_query=rewritten,
+                        scope_file_ids=scope_file_ids,
+                        vector_store=vector_store,
+                        embedding_service=embedding_service,
+                        keyword_service=keyword_service,
+                        enable_keyword=enable_keyword,
+                        keyword_top_k=keyword_top_k,
+                        vector_weight=vector_weight,
+                        keyword_weight=keyword_weight,
+                        enable_reranker=enable_reranker,
+                        initial_top_k=initial_top_k,
+                        rerank_top_n=rerank_top_n,
+                        topic_terms=rewrite_topic_terms,
+                    )
+                    logger.info(
+                        ">>> RETRIEVAL: rewrite scoped pool docs=%s context_chunks=%s",
                         len(scope_file_ids),
                         len(context_chunks),
                     )
 
-    # Ensure figure requests get image_caption chunks (with viewable URLs), not only text hits
-    context_chunks = _maybe_supplement_image_caption_chunks(
-        context_chunks, query, scope_file_ids, technologies
+    # Phase 4 graph expansion (+ figure fallback via illustrates edges or supplement)
+    context_chunks = await asyncio.to_thread(
+        _expand_context_graph,
+        context_chunks,
+        query=query,
+        scope_file_ids=scope_file_ids,
+        technologies=technologies,
     )
 
     # Hydrate chunks with raw data (tables/code/images)
-    context_chunks = _hydrate_chunks(context_chunks)
+    context_chunks = await asyncio.to_thread(_hydrate_chunks, context_chunks)
 
     # Chat history for context window
     chat_history = chat_service.get_context_messages(session_id, context_window=6)
@@ -878,30 +1192,38 @@ async def chat(request: ChatRequest):
     )
     # Marginal similarity on huge PDFs often clusters ~0.22–0.28; avoid blocking near threshold.
     if avg_similarity < 0.22 or chunk_count < 2:
-        answer = _insufficient_context_message(available_technologies)
-        chat_service.add_message(session_id, "assistant", answer)
-        detected_technology_str = ", ".join(technologies) if technologies else None
-        return ChatResponse(
-            answer=answer,
-            session_id=session_id,
-            sources=None,
-            detected_technology=detected_technology_str,
-            detected_domain=domain,
-        )
+        return {
+            "session_id": session_id,
+            "query": query,
+            "technologies": technologies,
+            "domain": domain,
+            "context_chunks": context_chunks,
+            "chat_service": chat_service,
+            "chat_history": chat_history,
+            "available_technologies": available_technologies,
+            "insufficient_answer": _insufficient_context_message(available_technologies),
+        }
 
-    # Generate answer
-    llm_service = get_llm_service()
-    answer = llm_service.generate_response(
-        query=query,
-        context_chunks=context_chunks,
-        chat_history=chat_history,
-        available_technologies=available_technologies,
-    )
+    return {
+        "session_id": session_id,
+        "query": query,
+        "technologies": technologies,
+        "domain": domain,
+        "context_chunks": context_chunks,
+        "chat_service": chat_service,
+        "chat_history": chat_history,
+        "available_technologies": available_technologies,
+        "insufficient_answer": None,
+    }
 
-    # Persist assistant message
-    assistant_row = chat_service.add_message(session_id, "assistant", answer)
 
-    # Token/cost logs (per assistant turn). Costs are optional and require env vars.
+def _record_llm_usage(
+    *,
+    session_id: str,
+    message_id,
+    query: str,
+    llm_service: LLMService,
+) -> None:
     usage = getattr(llm_service, "last_usage", None) or {}
     prompt_toks = usage.get("prompt_tokens")
     completion_toks = usage.get("completion_tokens")
@@ -931,7 +1253,7 @@ async def chat(request: ChatRequest):
     logger.info(
         ">>> TOKENS: session=%s msg_id=%s provider=%s model=%s prompt=%s completion=%s total=%s cost_usd=%s",
         session_id,
-        assistant_row.get("id"),
+        message_id,
         provider,
         model_used,
         prompt_toks,
@@ -942,7 +1264,7 @@ async def chat(request: ChatRequest):
 
     record_chat_completion(
         session_id=session_id,
-        message_id=assistant_row.get("id"),
+        message_id=message_id,
         query_preview=query,
         prompt_tokens=prompt_toks,
         completion_tokens=completion_toks,
@@ -952,20 +1274,132 @@ async def chat(request: ChatRequest):
         cost_usd=float(cost_usd) if isinstance(cost_usd, (int, float)) else None,
     )
 
-    # Sources from retrieved chunks (e.g. file names / technologies)
-    sources = []
-    for c in context_chunks:
-        tech = c.get("technology") or c.get("file_name")
-        if tech and tech not in sources:
-            sources.append(tech if isinstance(tech, str) else str(tech))
-    sources = list(sources)[:10]
-    logger.info(">>> CHAT: done session_id=%s sources=%s", session_id[:8] + "...", sources)
 
+def _chat_response_from_turn(turn: dict, answer: str) -> ChatResponse:
+    technologies = turn.get("technologies") or []
+    domain = turn.get("domain")
+    context_chunks = turn.get("context_chunks") or []
+    sources = _sources_from_chunks(context_chunks)
     detected_technology_str = ", ".join(technologies) if technologies else None
     return ChatResponse(
         answer=answer,
-        session_id=session_id,
+        session_id=turn["session_id"],
         sources=sources if sources else None,
         detected_technology=detected_technology_str,
         detected_domain=domain,
+    )
+
+
+@router.post("/", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """RAG chat (non-streaming). Creates a session when session_id is omitted."""
+    turn = await _rag_turn_async(request)
+    chat_service = turn["chat_service"]
+    session_id = turn["session_id"]
+    query = turn["query"]
+
+    if turn.get("insufficient_answer"):
+        answer = turn["insufficient_answer"]
+        chat_service.add_message(session_id, "assistant", answer)
+        return _chat_response_from_turn(turn, answer)
+
+    llm_service = get_llm_service()
+    answer = llm_service.generate_response(
+        query=query,
+        context_chunks=turn["context_chunks"],
+        chat_history=turn["chat_history"],
+        available_technologies=turn["available_technologies"],
+    )
+    assistant_row = chat_service.add_message(session_id, "assistant", answer)
+    _record_llm_usage(
+        session_id=session_id,
+        message_id=assistant_row.get("id"),
+        query=query,
+        llm_service=llm_service,
+    )
+    logger.info(">>> CHAT: done session_id=%s", session_id[:8] + "...")
+    return _chat_response_from_turn(turn, answer)
+
+
+@router.post("/stream")
+async def chat_stream(request: ChatRequest):
+    """RAG chat with SSE token streaming for the assistant reply."""
+    turn = await _rag_turn_async(request)
+    chat_service = turn["chat_service"]
+    session_id = turn["session_id"]
+    query = turn["query"]
+    technologies = turn.get("technologies") or []
+    domain = turn.get("domain")
+    detected_technology_str = ", ".join(technologies) if technologies else None
+
+    async def event_generator():
+        meta = {
+            "type": "meta",
+            "session_id": session_id,
+            "detected_technology": detected_technology_str,
+            "detected_domain": domain,
+        }
+        yield _sse_payload(meta)
+
+        if turn.get("insufficient_answer"):
+            answer = turn["insufficient_answer"]
+            chat_service.add_message(session_id, "assistant", answer)
+            yield _sse_payload({"type": "token", "content": answer})
+            yield _sse_payload(
+                {
+                    "type": "done",
+                    "answer": answer,
+                    "session_id": session_id,
+                    "sources": None,
+                    "detected_technology": detected_technology_str,
+                    "detected_domain": domain,
+                }
+            )
+            return
+
+        llm_service = get_llm_service()
+        parts: list = []
+        try:
+            for delta in llm_service.stream_response(
+                query=query,
+                context_chunks=turn["context_chunks"],
+                chat_history=turn["chat_history"],
+                available_technologies=turn["available_technologies"],
+            ):
+                parts.append(delta)
+                yield _sse_payload({"type": "token", "content": delta})
+        except Exception as e:
+            logger.exception(">>> CHAT STREAM: LLM error: %s", e)
+            yield _sse_payload({"type": "error", "detail": str(e)})
+            return
+
+        answer = "".join(parts).strip()
+        assistant_row = chat_service.add_message(session_id, "assistant", answer)
+        _record_llm_usage(
+            session_id=session_id,
+            message_id=assistant_row.get("id"),
+            query=query,
+            llm_service=llm_service,
+        )
+        sources = _sources_from_chunks(turn["context_chunks"])
+        logger.info(">>> CHAT STREAM: done session_id=%s", session_id[:8] + "...")
+        yield _sse_payload(
+            {
+                "type": "done",
+                "answer": answer,
+                "session_id": session_id,
+                "sources": sources if sources else None,
+                "detected_technology": detected_technology_str,
+                "detected_domain": domain,
+            }
+        )
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )

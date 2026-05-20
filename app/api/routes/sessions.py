@@ -52,6 +52,14 @@ async def list_sessions():
     return result
 
 
+@router.delete("/")
+async def delete_all_sessions():
+    """Delete all chat sessions and their messages."""
+    chat_service = get_chat_service()
+    deleted_count = await chat_service.delete_all_sessions_async()
+    return {"message": "All sessions deleted", "deleted_count": deleted_count}
+
+
 @router.get("/{session_id}", response_model=ChatSessionResponse)
 async def get_session(session_id: str):
     """Get a session by ID."""

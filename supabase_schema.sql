@@ -99,6 +99,32 @@ CREATE TABLE IF NOT EXISTS chunks_fts (
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_fts_document_id ON chunks_fts(document_id);
 
+-- Phase 1: semantic document tree (section hierarchy + reading order)
+CREATE TABLE IF NOT EXISTS document_nodes (
+    node_id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    node_type TEXT NOT NULL,
+    title TEXT,
+    content_preview TEXT,
+    page_start INT DEFAULT 1,
+    page_end INT DEFAULT 1,
+    parent_node_id TEXT,
+    depth INT DEFAULT 0,
+    order_index INT DEFAULT 0,
+    section_path_json TEXT DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_document_nodes_document ON document_nodes(document_id);
+CREATE INDEX IF NOT EXISTS idx_document_nodes_parent ON document_nodes(parent_node_id);
+
+CREATE TABLE IF NOT EXISTS document_edges (
+    edge_id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    from_node_id TEXT NOT NULL,
+    to_node_id TEXT NOT NULL,
+    edge_type TEXT NOT NULL DEFAULT 'parent_of'
+);
+CREATE INDEX IF NOT EXISTS idx_document_edges_document ON document_edges(document_id);
+
 -- LLM usage / dashboard (token counts per chat completion)
 CREATE TABLE IF NOT EXISTS usage_events (
     id BIGSERIAL PRIMARY KEY,
@@ -131,5 +157,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_created ON usage_events(created_at D
 --   chunks,
 --   raw_tables,
 --   raw_code_blocks,
---   raw_images
+--   raw_images,
+--   document_edges,
+--   document_nodes
 -- RESTART IDENTITY;

@@ -24,8 +24,8 @@ class Settings(BaseSettings):
     GROQ_MAX_CONTEXT_CHARS: int = 16000
     GROQ_MAX_CHAT_HISTORY_CHARS: int = 4000
     GROQ_MAX_CHARS_PER_CHUNK: int = 3200
-    GROQ_RERANK_MAX_CHUNKS: int = 14
-    GROQ_RERANK_SNIPPET_CHARS: int = 900
+    GROQ_RERANK_MAX_CHUNKS: int = 22
+    GROQ_RERANK_SNIPPET_CHARS: int = 1200
     # USD per 1M tokens for dashboard cost when LLM_PROVIDER=groq (defaults ≈ Groq on-demand
     # llama-3.3-70b-versatile; see https://groq.com/pricing — override if you use another model/tier).
     GROQ_INPUT_USD_PER_1M: float = 0.59
@@ -43,6 +43,13 @@ class Settings(BaseSettings):
     # Large inserts: smaller batches + long timeouts reduce WriteTimeout errors to Zilliz Cloud.
     ZILLIZ_INSERT_BATCH_SIZE: int = 40
     ZILLIZ_INSERT_TIMEOUT_SECONDS: float = 300.0
+    ZILLIZ_DELETE_TIMEOUT_SECONDS: float = 60.0
+
+    # Parallel purge when deleting library documents (Zilliz + Supabase run concurrently)
+    DELETE_PARALLEL_WORKERS: int = 4
+
+    # Concurrent batch uploads (each file runs full async ingest pipeline)
+    BATCH_UPLOAD_CONCURRENT: int = 2
     
     # Application Configuration
     UPLOAD_DIR: str = "uploads"
@@ -62,16 +69,16 @@ class Settings(BaseSettings):
     VISION_CAPTION_MODEL: str = "gpt-4o-mini"
     MAX_VISION_CAPTIONS_PER_DOCUMENT: int = 30
 
-    # Reranker: retrieve more chunks, then rerank to keep best (improves answer quality)
+    # Reranker: fetch a wide pool, score top N with LLM, pass best to answer LLM
     ENABLE_RERANKER: bool = True
-    RERANK_INITIAL_TOP_K: int = 30   # Fetch this many from vector search
-    RERANK_TOP_N: int = 10           # After rerank, keep this many for LLM
+    RERANK_INITIAL_TOP_K: int = 45   # Vector hybrid pool size (per query)
+    RERANK_TOP_N: int = 12           # Chunks sent to answer LLM after rerank
     
     # Hybrid retrieval (vector + keyword/BM25)
     ENABLE_KEYWORD_SEARCH: bool = True
     HYBRID_VECTOR_WEIGHT: float = 0.7
     HYBRID_KEYWORD_WEIGHT: float = 0.3
-    KEYWORD_TOP_K: int = 20
+    KEYWORD_TOP_K: int = 45          # Match RERANK_INITIAL_TOP_K so keyword hits enter rerank pool
 
     # Self-refining retrieval loop
     ENABLE_QUERY_REWRITE: bool = True
@@ -79,6 +86,23 @@ class Settings(BaseSettings):
     # When the client sends no file_ids and the session has no scope, search all INGESTED
     # documents in the library (retrieval + reranker still pick the best chunks per query).
     CHAT_AUTO_SCOPE_ALL_INGESTED: bool = True
+    # Max documents in a single pooled vector+keyword search (in-filter). Above this, cap with a warning.
+    CHAT_SCOPED_POOL_MAX_DOCUMENTS: int = 40
+
+    # Phase 2: LLM disambiguation for figure ↔ paragraph links (multiple figures per page)
+    ENABLE_LLM_CROSS_TYPE_LINKS: bool = False
+
+    # Phase 3: prefix chunk text for embeddings (retrieval_text unchanged for display)
+    ENABLE_CONTEXTUAL_EMBEDDINGS: bool = True
+    # Optional Anthropic-style one-line context per chunk at ingest (extra LLM cost)
+    ENABLE_LLM_CONTEXTUAL_EMBEDDINGS: bool = False
+
+    # Phase 4: graph-aware expansion after retrieval/rerank
+    ENABLE_GRAPH_CONTEXT_EXPANSION: bool = True
+    CONTEXT_EXPANSION_DECAY: float = 0.85
+    CONTEXT_EXPANSION_MAX_ADD: int = 14
+    CONTEXT_EXPANSION_SIBLING_MARGIN: float = 0.92
+    CONTEXT_EXPANSION_MAX_CHARS: int = 28000
 
     # Upload-time technology/domain tagging
     # MODE: "prompt" = one LLM call (ChatGPT-style) then fallback heuristics on failure;

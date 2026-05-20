@@ -1,8 +1,9 @@
 """OpenAI embedding service with batch processing support."""
-from openai import OpenAI
-from typing import List
-import os
+import asyncio
 import time
+from typing import List
+
+from openai import AsyncOpenAI, OpenAI
 
 
 class EmbeddingService:
@@ -17,6 +18,7 @@ class EmbeddingService:
             model: Embedding model name
         """
         self.client = OpenAI(api_key=api_key)
+        self.async_client = AsyncOpenAI(api_key=api_key)
         self.model = model
         # Default batch size: 100 chunks per batch
         # Each chunk ~1000 chars ≈ ~250 tokens, so 100 chunks ≈ 25k tokens (well under 300k limit)
@@ -106,5 +108,59 @@ class EmbeddingService:
                 raise
         
         print(f">>> EMBEDDING: Successfully generated {len(all_embeddings)} embeddings", flush=True)
+        return all_embeddings
+
+    async def generate_embedding_async(self, text: str) -> List[float]:
+        """Non-blocking single-text embedding (OpenAI async client)."""
+        response = await self.async_client.embeddings.create(
+            model=self.model,
+            input=text,
+        )
+        return response.data[0].embedding
+
+    async def generate_embeddings_async(
+        self, texts: List[str], batch_size: int = None
+    ) -> List[List[float]]:
+        """Non-blocking batched embeddings for ingest and retrieval."""
+        if not texts:
+            return []
+
+        if batch_size is None:
+            batch_size = self.default_batch_size
+
+        if len(texts) <= batch_size:
+            print(f">>> EMBEDDING (async): Processing {len(texts)} chunks in single batch", flush=True)
+            response = await self.async_client.embeddings.create(
+                model=self.model,
+                input=texts,
+            )
+            return [item.embedding for item in response.data]
+
+        all_embeddings: List[List[float]] = []
+        total_batches = (len(texts) + batch_size - 1) // batch_size
+        print(
+            f">>> EMBEDDING (async): Processing {len(texts)} chunks in {total_batches} batches",
+            flush=True,
+        )
+
+        for i in range(0, len(texts), batch_size):
+            batch_num = i // batch_size + 1
+            batch = texts[i : i + batch_size]
+            print(
+                f">>> EMBEDDING (async): Batch {batch_num}/{total_batches} ({len(batch)} chunks)",
+                flush=True,
+            )
+            response = await self.async_client.embeddings.create(
+                model=self.model,
+                input=batch,
+            )
+            all_embeddings.extend(item.embedding for item in response.data)
+            if batch_num < total_batches:
+                await asyncio.sleep(0.1)
+
+        print(
+            f">>> EMBEDDING (async): Successfully generated {len(all_embeddings)} embeddings",
+            flush=True,
+        )
         return all_embeddings
 

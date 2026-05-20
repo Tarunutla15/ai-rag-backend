@@ -4,6 +4,7 @@ All operations (collection creation, insert, search, delete) use REST API for re
 Supports intelligent query routing with technology and domain filters.
 """
 
+import asyncio
 import httpx
 import json
 import time
@@ -20,6 +21,10 @@ def _zilliz_insert_timeout() -> httpx.Timeout:
     return httpx.Timeout(connect=30.0, read=sec, write=sec, pool=30.0)
 
 
+def _zilliz_delete_timeout() -> float:
+    return float(getattr(settings, "ZILLIZ_DELETE_TIMEOUT_SECONDS", 60.0))
+
+
 def _default_insert_batch_size() -> int:
     return int(getattr(settings, "ZILLIZ_INSERT_BATCH_SIZE", 40))
 
@@ -33,6 +38,33 @@ CODE_SUFFIX = "code_blocks"
 TABLES_SUFFIX = "tables"
 
 _BUCKET_ORDER = ("text", "code", "tables")
+
+
+def _build_search_filter_expr(
+    *,
+    technology: Optional[str] = None,
+    domain: Optional[str] = None,
+    document_id: Optional[str] = None,
+    file_id: Optional[str] = None,
+    document_ids: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Build Zilliz boolean filter for search/delete."""
+    filters: List[str] = []
+    if technology:
+        filters.append(f'technology == "{technology}"')
+    if domain:
+        filters.append(f'domain == "{domain}"')
+    if document_ids:
+        ids = [f'"{str(d).strip()}"' for d in document_ids if d and str(d).strip()]
+        if len(ids) == 1:
+            filters.append(f"document_id == {ids[0]}")
+        elif ids:
+            filters.append(f"document_id in [{', '.join(ids)}]")
+    elif document_id:
+        filters.append(f'document_id == "{document_id}"')
+    elif file_id:
+        filters.append(f'file_id == "{file_id}"')
+    return " and ".join(filters) if filters else None
 
 
 def chunk_type_to_bucket(chunk_type: Optional[str]) -> str:
@@ -114,6 +146,70 @@ def _allocate_bucket_top_k(total_k: int, weights: Dict[str, float]) -> Dict[str,
         rem -= 1
         i += 1
     return floors
+
+
+def _format_zilliz_search_hits(result_data: dict) -> List[Dict]:
+    """Parse Zilliz search JSON into normalized chunk dicts."""
+    if result_data.get("code") != 0:
+        logger.error(f"Search failed: {result_data}")
+        return []
+    formatted: List[Dict] = []
+    if "data" not in result_data:
+        return formatted
+    for hit in result_data["data"]:
+        chunk_id = hit.get("chunk_id", "")
+        metadata_json = hit.get("metadata_json", "")
+        if not chunk_id and metadata_json:
+            try:
+                meta_obj = json.loads(metadata_json)
+                chunk_id = meta_obj.get("chunk_id", "") if isinstance(meta_obj, dict) else ""
+            except Exception:
+                chunk_id = ""
+        formatted.append({
+            "text": hit.get("text", ""),
+            "document_id": hit.get("document_id", ""),
+            "file_name": hit.get("file_name", ""),
+            "technology": hit.get("technology", "general"),
+            "domain": hit.get("domain", "general"),
+            "chunk_index": hit.get("chunk_index", 0),
+            "page_number": hit.get("page_number", -1),
+            "section_title": hit.get("section_title", ""),
+            "chunk_type": hit.get("chunk_type", "paragraph"),
+            "metadata_json": hit.get("metadata_json", ""),
+            "chunk_id": chunk_id,
+            "score": hit.get("distance", hit.get("score", 0.0)),
+        })
+    return formatted
+
+
+def _build_search_payload(
+    collection_name: str,
+    query_embedding: List[float],
+    top_k: int,
+    expr: Optional[str],
+) -> dict:
+    payload = {
+        "collectionName": collection_name,
+        "data": [query_embedding],
+        "annsField": "vector",
+        "limit": top_k,
+        "outputFields": [
+            "text",
+            "document_id",
+            "file_name",
+            "technology",
+            "domain",
+            "chunk_index",
+            "page_number",
+            "section_title",
+            "chunk_type",
+            "metadata_json",
+            "chunk_id",
+        ],
+    }
+    if expr:
+        payload["filter"] = expr
+    return payload
 
 
 class _ZillizCollection:
@@ -697,6 +793,7 @@ class _ZillizCollection:
         domain: Optional[str] = None,
         document_id: Optional[str] = None,
         file_id: Optional[str] = None,
+        document_ids: Optional[List[str]] = None,
     ) -> List[Dict]:
         """
         Search for similar chunks in the vector store.
@@ -708,98 +805,73 @@ class _ZillizCollection:
             domain: Filter by domain (e.g., 'frontend', 'backend')
             document_id: Filter by specific document ID
             file_id: Filter by specific file ID
+            document_ids: Filter to any of these document IDs (scoped chat pool)
             
         Returns:
             List of matching chunks with metadata
         """
-        # Build filter expression - combine multiple filters with AND
-        filters = []
-        
-        if technology:
-            filters.append(f'technology == "{technology}"')
-        if domain:
-            filters.append(f'domain == "{domain}"')
-        if document_id:
-            filters.append(f'document_id == "{document_id}"')
-        elif file_id:
-            filters.append(f'file_id == "{file_id}"')
-        
-        expr = " and ".join(filters) if filters else None
-
-        # Search using REST API: /v2/vectordb/entities/search
-        search_payload = {
-            "collectionName": self.collection_name,
-            "data": [query_embedding],  # Array of vectors to search
-            "annsField": "vector",       # The vector field name in schema
-            "limit": top_k,
-            "outputFields": [
-                "text",
-                "document_id",
-                "file_name",
-                "technology",
-                "domain",
-                "chunk_index",
-                "page_number",
-                "section_title",
-                "chunk_type",
-                "metadata_json",
-                "chunk_id",
-            ],
-        }
-        
-        if expr:
-            search_payload["filter"] = expr
-
+        expr = _build_search_filter_expr(
+            technology=technology,
+            domain=domain,
+            document_id=document_id,
+            file_id=file_id,
+            document_ids=document_ids,
+        )
+        search_payload = _build_search_payload(
+            self.collection_name, query_embedding, top_k, expr
+        )
         logger.info(f"Search request: collection={self.collection_name}, limit={top_k}, filter={expr}")
-        
+
         response = httpx.post(
             self._get_api_url("search"),
             headers=self.headers,
             json=search_payload,
             timeout=30.0,
         )
-        
         result_data = response.json()
-        logger.info(f"Search response: code={result_data.get('code')}, message={result_data.get('message', 'N/A')}")
-        
-        # Check for errors
-        if result_data.get("code") != 0:
-            logger.error(f"Search failed: {result_data}")
-            return []
-        
-        # Format results - Zilliz API returns data in "data" field
-        formatted = []
-        if "data" in result_data:
-            for hit in result_data["data"]:
-                # Attempt to parse chunk_id from field or metadata_json
-                chunk_id = hit.get("chunk_id", "")
-                metadata_json = hit.get("metadata_json", "")
-                if not chunk_id and metadata_json:
-                    try:
-                        meta_obj = json.loads(metadata_json)
-                        chunk_id = meta_obj.get("chunk_id", "") if isinstance(meta_obj, dict) else ""
-                    except Exception:
-                        chunk_id = ""
-                formatted.append({
-                    "text": hit.get("text", ""),
-                    "document_id": hit.get("document_id", ""),
-                    "file_name": hit.get("file_name", ""),
-                    "technology": hit.get("technology", "general"),
-                    "domain": hit.get("domain", "general"),
-                    "chunk_index": hit.get("chunk_index", 0),
-                    "page_number": hit.get("page_number", -1),
-                    "section_title": hit.get("section_title", ""),
-                    "chunk_type": hit.get("chunk_type", "paragraph"),
-                    "metadata_json": hit.get("metadata_json", ""),
-                    "chunk_id": chunk_id,
-                    "score": hit.get("distance", hit.get("score", 0.0)),
-                })
-        
+        logger.info(
+            f"Search response: code={result_data.get('code')}, message={result_data.get('message', 'N/A')}"
+        )
+        formatted = _format_zilliz_search_hits(result_data)
         logger.info(f"Search returned {len(formatted)} results")
         return formatted
 
-    def delete_by_document_id(self, document_id: str) -> bool:
-        """Delete entities by document_id using REST API."""
+    async def search_async(
+        self,
+        query_embedding: List[float],
+        top_k: int = 5,
+        technology: Optional[str] = None,
+        domain: Optional[str] = None,
+        document_id: Optional[str] = None,
+        file_id: Optional[str] = None,
+        document_ids: Optional[List[str]] = None,
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> List[Dict]:
+        """Async vector search (shared httpx client when provided)."""
+        expr = _build_search_filter_expr(
+            technology=technology,
+            domain=domain,
+            document_id=document_id,
+            file_id=file_id,
+            document_ids=document_ids,
+        )
+        search_payload = _build_search_payload(
+            self.collection_name, query_embedding, top_k, expr
+        )
+        url = self._get_api_url("search")
+        owns_client = client is None
+        if owns_client:
+            client = httpx.AsyncClient(timeout=30.0)
+        try:
+            response = await client.post(url, headers=self.headers, json=search_payload)
+            result_data = response.json()
+            return _format_zilliz_search_hits(result_data)
+        finally:
+            if owns_client:
+                await client.aclose()
+
+    async def delete_by_document_id_async(self, document_id: str, client: httpx.AsyncClient) -> bool:
+        """Delete entities by document_id (async HTTP)."""
         if not document_id or not str(document_id).strip():
             logger.warning("delete_by_document_id: skipped empty document_id")
             return False
@@ -807,16 +879,28 @@ class _ZillizCollection:
             "collectionName": self.collection_name,
             "filter": f'document_id == "{document_id}"',
         }
-
-        response = httpx.post(
+        response = await client.post(
             self._get_api_url("delete"),
             headers=self.headers,
             json=delete_payload,
-            timeout=30.0,
+            timeout=_zilliz_delete_timeout(),
         )
         response.raise_for_status()
-        logger.info(f"Deleted chunks for document_id={document_id}")
+        logger.info(
+            "Deleted chunks async document_id=%s collection=%s",
+            document_id[:8],
+            self.collection_name,
+        )
         return True
+
+    def delete_by_document_id(self, document_id: str) -> bool:
+        """Sync wrapper for non-async callers (e.g. ingest rollback)."""
+        return asyncio.run(self._delete_by_document_id_async_single(document_id))
+
+    async def _delete_by_document_id_async_single(self, document_id: str) -> bool:
+        timeout = httpx.Timeout(_zilliz_delete_timeout())
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            return await self.delete_by_document_id_async(document_id, client)
 
     def delete_by_file_id(self, file_id: str) -> bool:
         """Delete entities by file_id using REST API."""
@@ -971,6 +1055,7 @@ class VectorStore:
         document_id: Optional[str] = None,
         file_id: Optional[str] = None,
         query_text: Optional[str] = None,
+        document_ids: Optional[List[str]] = None,
     ) -> List[Dict]:
         """
         Search every typed collection (text, code, tables), merge, re-score by query intent, return top_k.
@@ -992,6 +1077,7 @@ class VectorStore:
                 domain=domain,
                 document_id=document_id,
                 file_id=file_id,
+                document_ids=document_ids,
             )
             wb = weights.get(bucket, 0.0)
             for h in hits:
@@ -1005,12 +1091,198 @@ class VectorStore:
         merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
         return merged[:top_k]
 
-    def delete_by_document_id(self, document_id: str) -> bool:
+    async def search_async(
+        self,
+        query_embedding: List[float],
+        top_k: int = 5,
+        technology: Optional[str] = None,
+        domain: Optional[str] = None,
+        document_id: Optional[str] = None,
+        file_id: Optional[str] = None,
+        query_text: Optional[str] = None,
+        document_ids: Optional[List[str]] = None,
+    ) -> List[Dict]:
+        """Search text/code/table collections concurrently, merge, re-score."""
+        weights = infer_retrieval_bucket_weights(query_text or "")
+        limits = _allocate_bucket_top_k(top_k, weights)
+        wmax = max(weights.values()) or 1.0
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            tasks = []
+            bucket_keys = []
+            for bucket in _BUCKET_ORDER:
+                lim = limits[bucket]
+                if lim <= 0:
+                    continue
+                bucket_keys.append(bucket)
+                tasks.append(
+                    self._by_bucket[bucket].search_async(
+                        query_embedding=query_embedding,
+                        top_k=lim,
+                        technology=technology,
+                        domain=domain,
+                        document_id=document_id,
+                        file_id=file_id,
+                        document_ids=document_ids,
+                        client=client,
+                    )
+                )
+            if not tasks:
+                return []
+            results = await asyncio.gather(*tasks)
+
+        merged: List[Dict] = []
+        for bucket, hits in zip(bucket_keys, results):
+            wb = weights.get(bucket, 0.0)
+            for h in hits:
+                raw = h.get("score", 0.0)
+                sim = _normalize_similarity_score(raw)
+                h["raw_vector_score"] = raw
+                h["vector_bucket"] = bucket
+                h["score"] = sim * (0.55 + 0.45 * (wb / wmax))
+                merged.append(h)
+
+        merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        return merged[:top_k]
+
+    async def insert_chunks_async(
+        self,
+        chunks: List[str],
+        embeddings: List[List[float]],
+        document_id: str,
+        file_hash: str,
+        file_name: str,
+        file_size: int,
+        technology: str = "general",
+        domain: str = "general",
+        chunk_metadata: Optional[List[Dict]] = None,
+        file_id: Optional[str] = None,
+        chunk_ids: Optional[List[str]] = None,
+        batch_size: Optional[int] = None,
+        chunk_indices: Optional[List[int]] = None,
+        chunk_char_starts: Optional[List[int]] = None,
+    ) -> int:
+        """Insert into typed buckets in parallel (thread pool per bucket HTTP batches)."""
+        if not chunks:
+            return 0
+
+        def _insert_bucket(bucket: str) -> int:
+            if len(chunks) != len(embeddings):
+                raise ValueError("Chunks and embeddings length mismatch")
+            n = len(chunks)
+            idx_list = list(chunk_indices) if chunk_indices is not None else list(range(n))
+            if chunk_char_starts is not None:
+                if len(chunk_char_starts) != n:
+                    raise ValueError("chunk_char_starts length mismatch")
+                char_list = list(chunk_char_starts)
+            else:
+                pos = 0
+                char_list = []
+                for c in chunks:
+                    char_list.append(pos)
+                    pos += len(c)
+            per_bucket: Dict[str, List[int]] = {k: [] for k in _BUCKET_ORDER}
+            for i in range(n):
+                meta = chunk_metadata[i] if chunk_metadata else {}
+                b = chunk_type_to_bucket(meta.get("chunk_type"))
+                per_bucket[b].append(i)
+            idxs = per_bucket[bucket]
+            if not idxs:
+                return 0
+            store = self._by_bucket[bucket]
+            sub_chunks = [chunks[i] for i in idxs]
+            sub_emb = [embeddings[i] for i in idxs]
+            sub_meta = [chunk_metadata[i] for i in idxs] if chunk_metadata else None
+            sub_ids = [chunk_ids[i] for i in idxs] if chunk_ids else None
+            sub_idx = [idx_list[i] for i in idxs]
+            sub_char = [char_list[i] for i in idxs]
+            return store.insert_chunks(
+                sub_chunks,
+                sub_emb,
+                document_id,
+                file_hash,
+                file_name,
+                file_size,
+                technology=technology,
+                domain=domain,
+                chunk_metadata=sub_meta,
+                file_id=file_id,
+                chunk_ids=sub_ids,
+                batch_size=batch_size,
+                chunk_indices=sub_idx,
+                chunk_char_starts=sub_char,
+            )
+
+        try:
+            results = await asyncio.gather(
+                *[
+                    asyncio.to_thread(_insert_bucket, bucket)
+                    for bucket in _BUCKET_ORDER
+                ],
+                return_exceptions=True,
+            )
+        except Exception:
+            try:
+                await self.delete_by_document_id_async(document_id)
+            except Exception as rb_err:
+                logger.warning("VectorStore async insert rollback failed: %s", rb_err)
+            raise
+
+        total_inserted = 0
+        for bucket, result in zip(_BUCKET_ORDER, results):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "Typed async insert failed bucket=%s doc=%s: %s",
+                    bucket,
+                    document_id[:8],
+                    result,
+                )
+                try:
+                    await self.delete_by_document_id_async(document_id)
+                except Exception as rb_err:
+                    logger.warning("VectorStore async insert rollback failed: %s", rb_err)
+                raise result
+            total_inserted += int(result or 0)
+
+        logger.info(
+            "Typed async insert into Zilliz base=%s total_rows=%s",
+            self.base_collection_name,
+            total_inserted,
+        )
+        return total_inserted
+
+    async def delete_by_document_id_async(self, document_id: str) -> bool:
+        """Delete from text/code/table collections concurrently via async HTTP."""
+        if not document_id or not str(document_id).strip():
+            return False
+        stores = list(self._by_bucket.values())
+        if not stores:
+            return False
+        if len(stores) == 1:
+            return await stores[0]._delete_by_document_id_async_single(document_id)
+
+        timeout = httpx.Timeout(_zilliz_delete_timeout())
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            results = await asyncio.gather(
+                *[s.delete_by_document_id_async(document_id, client) for s in stores],
+                return_exceptions=True,
+            )
         ok_any = False
-        for store in self._by_bucket.values():
-            if store.delete_by_document_id(document_id):
+        for store, result in zip(stores, results):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "Zilliz async delete failed collection=%s doc=%s: %s",
+                    store.collection_name,
+                    document_id[:8],
+                    result,
+                )
+            elif result:
                 ok_any = True
         return ok_any
+
+    def delete_by_document_id(self, document_id: str) -> bool:
+        """Sync wrapper for non-async callers."""
+        return asyncio.run(self.delete_by_document_id_async(document_id))
 
     def delete_by_file_id(self, file_id: str) -> bool:
         ok_any = False

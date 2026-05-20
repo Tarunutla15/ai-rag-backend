@@ -2,6 +2,7 @@
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from typing import List, Tuple, Dict, Optional
 from app.services.raw_block_store import get_raw_block_store
+from app.services.document_tree import merge_tree_fields_into_chunk_meta
 
 
 class ChunkingService:
@@ -67,13 +68,16 @@ class ChunkingService:
         chunks: List[str] = []
         metadata_list: List[Dict] = []
 
+        source_ext = (file_name or "").lower().rsplit(".", 1)[-1] if file_name and "." in file_name else "pdf"
+        source_file_type = "docx" if source_ext == "docx" else "pdf"
+
         for block in blocks:
             block_type = block.get("block_type", "text")
             content = (block.get("content") or "").strip()
             page_number = block.get("page_number", -1)
             section_title = block.get("section_title", "")
             meta_base = {
-                "file_type": "pdf",
+                "file_type": source_file_type,
                 "language": "en",
                 "has_tables": block_type == "table",
                 "has_images": block_type == "image",
@@ -83,12 +87,17 @@ class ChunkingService:
                 "file_name": file_name,
                 "file_id": file_id,
             }
+            if block.get("block_id"):
+                meta_base["source_block_id"] = block["block_id"]
+            if block.get("page_context_block_id"):
+                meta_base["page_context_block_id"] = block["page_context_block_id"]
 
             if block_type == "heading":
                 if content:
                     chunks.append(content)
                     meta = dict(meta_base)
                     meta["chunk_type"] = "heading"
+                    merge_tree_fields_into_chunk_meta(block, meta)
                     metadata_list.append(meta)
                 continue
 
@@ -99,6 +108,7 @@ class ChunkingService:
                 for part in parts:
                     meta = dict(meta_base)
                     meta["chunk_type"] = "paragraph"
+                    merge_tree_fields_into_chunk_meta(block, meta)
                     metadata_list.append(meta)
                     chunks.append(part)
                 continue
@@ -128,6 +138,7 @@ class ChunkingService:
                 meta["chunk_type"] = "table_summary"
                 if raw_table_id:
                     meta["raw_table_id"] = raw_table_id
+                merge_tree_fields_into_chunk_meta(block, meta)
                 metadata_list.append(meta)
                 continue
 
@@ -148,6 +159,7 @@ class ChunkingService:
                 meta = dict(meta_base)
                 meta["chunk_type"] = "code_summary"
                 meta["raw_code_id"] = raw_code_id
+                merge_tree_fields_into_chunk_meta(block, meta)
                 metadata_list.append(meta)
                 continue
 
@@ -160,6 +172,8 @@ class ChunkingService:
                 meta = dict(meta_base)
                 meta["chunk_type"] = "image_caption"
                 meta["raw_image_id"] = raw_image_id
+                meta["caption"] = caption
+                merge_tree_fields_into_chunk_meta(block, meta)
                 metadata_list.append(meta)
                 continue
 

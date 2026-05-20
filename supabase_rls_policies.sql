@@ -51,3 +51,17 @@ CREATE POLICY "Allow all for anon" ON chunks_fts FOR ALL TO anon USING (true) WI
 ALTER TABLE usage_events ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Allow all for anon" ON usage_events;
 CREATE POLICY "Allow all for anon" ON usage_events FOR ALL TO anon USING (true) WITH CHECK (true);
+
+-- document_nodes / document_edges (Phase 1 semantic document tree)
+-- Required for upload: tree is written here before chunks/Zilliz.
+ALTER TABLE document_nodes ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Allow all for anon" ON document_nodes;
+DROP POLICY IF EXISTS "Allow all for authenticated" ON document_nodes;
+CREATE POLICY "Allow all for anon" ON document_nodes FOR ALL TO anon USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all for authenticated" ON document_nodes FOR ALL TO authenticated USING (true) WITH CHECK (true);
+
+ALTER TABLE document_edges ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Allow all for anon" ON document_edges;
+DROP POLICY IF EXISTS "Allow all for authenticated" ON document_edges;
+CREATE POLICY "Allow all for anon" ON document_edges FOR ALL TO anon USING (true) WITH CHECK (true);
+CREATE POLICY "Allow all for authenticated" ON document_edges FOR ALL TO authenticated USING (true) WITH CHECK (true);

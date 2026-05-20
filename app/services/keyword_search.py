@@ -3,7 +3,7 @@ Keyword (full-text) search: Supabase (ILIKE) or SQLite FTS5 depending on databas
 """
 
 import re
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Sequence
 import logging
 
 from app.services.database import get_database
@@ -11,10 +11,33 @@ from app.services.database import get_database
 logger = logging.getLogger(__name__)
 
 
+_KEYWORD_STOPWORDS = frozenset({
+    "what", "are", "is", "was", "the", "a", "an", "and", "or", "give", "some", "how",
+    "to", "in", "of", "for", "with", "about", "explain", "tell", "me", "can", "you",
+    "it", "this", "that", "those", "them", "depth", "examples", "example", "please",
+    "python", "javascript", "java", "csharp", "react", "node", "backend", "frontend",
+    "good", "best", "great", "nice", "very", "really", "just", "also", "nad", "adn", "nd",
+})
+
+
 def _tokenize_query(query: str) -> str:
     tokens = re.findall(r"[A-Za-z0-9_]+", query or "")
-    tokens = [t for t in tokens if len(t) >= 2]
-    return " ".join(tokens) if tokens else ""
+    kept = []
+    for t in tokens:
+        low = t.lower()
+        if len(low) < 3 or low in _KEYWORD_STOPWORDS:
+            continue
+        kept.append(low)
+        if low.endswith("s") and len(low) > 4:
+            kept.append(low[:-1])
+    # dedupe preserve order
+    seen: set = set()
+    out: list = []
+    for t in kept:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return " ".join(out) if out else ""
 
 
 def _build_fts_query_sqlite(query: str) -> Optional[str]:
@@ -99,10 +122,15 @@ class KeywordSearchService:
         domain: Optional[str] = None,
         document_id: Optional[str] = None,
         file_id: Optional[str] = None,
+        document_ids: Optional[Sequence[str]] = None,
     ) -> List[Dict]:
         if self._use_supabase:
-            return self._search_supabase(query, top_k, technology, domain, document_id, file_id)
-        return self._search_sqlite(query, top_k, technology, domain, document_id, file_id)
+            return self._search_supabase(
+                query, top_k, technology, domain, document_id, file_id, document_ids
+            )
+        return self._search_sqlite(
+            query, top_k, technology, domain, document_id, file_id, document_ids
+        )
 
     def _search_supabase(
         self,
@@ -112,6 +140,7 @@ class KeywordSearchService:
         domain: Optional[str],
         document_id: Optional[str],
         file_id: Optional[str],
+        document_ids: Optional[Sequence[str]] = None,
     ) -> List[Dict]:
         search_str = _tokenize_query(query)
         if not search_str:
@@ -126,7 +155,13 @@ class KeywordSearchService:
             sb_query = sb_query.eq("technology", technology)
         if domain:
             sb_query = sb_query.eq("domain", domain)
-        if document_id:
+        if document_ids:
+            ids = [str(d).strip() for d in document_ids if d and str(d).strip()]
+            if len(ids) == 1:
+                sb_query = sb_query.eq("document_id", ids[0])
+            elif ids:
+                sb_query = sb_query.in_("document_id", ids)
+        elif document_id:
             sb_query = sb_query.eq("document_id", document_id)
         elif file_id:
             sb_query = sb_query.eq("file_id", file_id)
@@ -172,6 +207,7 @@ class KeywordSearchService:
         domain: Optional[str],
         document_id: Optional[str],
         file_id: Optional[str],
+        document_ids: Optional[Sequence[str]] = None,
     ) -> List[Dict]:
         fts_query = _build_fts_query_sqlite(query)
         if not fts_query:
@@ -189,7 +225,16 @@ class KeywordSearchService:
         if domain:
             sql += " AND domain = %s"
             params.append(domain)
-        if document_id:
+        if document_ids:
+            ids = [str(d).strip() for d in document_ids if d and str(d).strip()]
+            if len(ids) == 1:
+                sql += " AND document_id = %s"
+                params.append(ids[0])
+            elif ids:
+                placeholders = ", ".join(["%s"] * len(ids))
+                sql += f" AND document_id IN ({placeholders})"
+                params.extend(ids)
+        elif document_id:
             sql += " AND document_id = %s"
             params.append(document_id)
         elif file_id:

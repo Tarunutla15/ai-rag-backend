@@ -3,6 +3,7 @@ Chat Service for managing chat sessions and messages.
 Supports Supabase (REST API) and SQLite fallback.
 """
 
+import asyncio
 import uuid
 from datetime import datetime
 from typing import List, Dict, Optional
@@ -141,6 +142,37 @@ class ChatService:
                     logger.info(f"Deleted session: {session_id}")
                     return True
                 return False
+
+    def _delete_all_sessions_sync(self) -> int:
+        """Bulk delete all sessions (blocking DB calls)."""
+        if self._use_supabase:
+            count_resp = self.db.supabase.table("chat_sessions").select("id", count="exact").execute()
+            removed = int(count_resp.count or 0)
+            if removed > 0:
+                self.db.supabase.table("chat_messages").delete().neq("session_id", "").execute()
+                self.db.supabase.table("session_documents").delete().neq("session_id", "").execute()
+                self.db.supabase.table("chat_sessions").delete().neq("id", "").execute()
+                logger.info("Deleted all chat sessions (bulk, count=%s)", removed)
+            return removed
+
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) as count FROM chat_sessions")
+            removed = int(cursor.fetchone()["count"] or 0)
+            if removed > 0:
+                cursor.execute("DELETE FROM chat_messages")
+                cursor.execute("DELETE FROM session_documents")
+                cursor.execute("DELETE FROM chat_sessions")
+                logger.info("Deleted all chat sessions (bulk SQLite, count=%s)", removed)
+        return removed
+
+    async def delete_all_sessions_async(self) -> int:
+        """Non-blocking wrapper for bulk session delete."""
+        return await asyncio.to_thread(self._delete_all_sessions_sync)
+
+    def delete_all_sessions(self) -> int:
+        """Sync entry point."""
+        return self._delete_all_sessions_sync()
     
     # ==================== MESSAGE OPERATIONS ====================
     
