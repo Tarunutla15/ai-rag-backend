@@ -89,6 +89,19 @@ async def purge_document_everywhere_async(document_id: str, vector_store) -> Dic
     except Exception as e:
         errors.append(f"files: {e}")
 
+    def _purge_storage():
+        try:
+            from app.services.blob_storage import delete_document_objects
+
+            delete_document_objects(document_id)
+        except Exception as e:
+            raise e
+
+    try:
+        await asyncio.to_thread(_purge_storage)
+    except Exception as e:
+        errors.append(f"storage: {e}")
+
     try:
         await asyncio.to_thread(store.delete_document_row, document_id)
     except Exception as e:

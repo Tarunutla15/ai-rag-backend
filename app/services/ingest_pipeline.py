@@ -26,6 +26,7 @@ from app.services.image_caption_enrichment import enrich_image_blocks_for_search
 from app.services.chunk_store import get_chunk_store
 from app.services.keyword_search import get_keyword_search_service
 from app.services.document_purge import purge_index_data_async
+from app.services.parent_child_chunks import build_section_parents, split_searchable_for_index
 
 logger = logging.getLogger(__name__)
 
@@ -137,39 +138,52 @@ async def ingest_document_async(
         chunk_ids, phase2_edges = chunk_store.prepare_chunk_ids_and_phase2_links(
             chunk_metadata, document_id, blocks=blocks
         )
+        parent_texts, parent_metas = build_section_parents(
+            chunks,
+            chunk_metadata,
+            document_id=document_id,
+            file_name=file_name,
+        )
+        all_chunks = list(chunks) + parent_texts
+        all_metadata = list(chunk_metadata) + parent_metas
         all_edges = list(tree_edges)
         all_edges.extend(phase2_edges)
         get_document_graph_store().insert_graph(document_id, tree_nodes, all_edges)
-        chunk_store.insert_chunks(chunks, chunk_metadata, document_id)
-        return chunk_ids, phase2_edges
+        chunk_store.insert_chunks(all_chunks, all_metadata, document_id)
+        return chunk_ids, phase2_edges, parent_texts
 
-    chunk_ids, phase2_edges = await asyncio.to_thread(_persist_graph_and_chunks)
+    chunk_ids, phase2_edges, parent_texts = await asyncio.to_thread(_persist_graph_and_chunks)
     print(
-        f">>> STEP 6b DONE: {len(chunk_ids)} chunk ids, {len(phase2_edges)} cross-type edges",
+        f">>> STEP 6b DONE: {len(chunk_ids)} child ids, {len(parent_texts)} section parents, "
+        f"{len(phase2_edges)} cross-type edges",
         flush=True,
     )
 
-    print(">>> STEP 7: Generating embeddings (async)...", flush=True)
+    search_chunks, search_metadata, search_chunk_ids = split_searchable_for_index(
+        chunks, chunk_metadata
+    )
+
+    print(">>> STEP 7: Generating embeddings (async, children only)...", flush=True)
     embeddings = await _texts_for_embedding_async(
-        chunks,
-        chunk_metadata,
+        search_chunks,
+        search_metadata,
         document_title=file_name,
         embedding_service=embedding_service,
     )
     print(f">>> STEP 7 DONE: Generated {len(embeddings)} embeddings", flush=True)
 
-    print(">>> STEP 8: Inserting into vector store (async)...", flush=True)
+    print(">>> STEP 8: Inserting into vector store (async, children only)...", flush=True)
     vector_store = get_vector_store_fn()
     chunks_created = await vector_store.insert_chunks_async(
-        chunks=chunks,
+        chunks=search_chunks,
         embeddings=embeddings,
         document_id=document_id,
         file_hash=file_hash,
         file_name=file_name,
         file_size=file_size,
-        chunk_metadata=chunk_metadata,
+        chunk_metadata=search_metadata,
         file_id=document_id,
-        chunk_ids=chunk_ids,
+        chunk_ids=search_chunk_ids,
         technology=technology,
         domain=domain,
     )
@@ -179,28 +193,43 @@ async def ingest_document_async(
         keyword_service = get_keyword_search_service()
         await asyncio.to_thread(keyword_service.delete_document, document_id)
         await asyncio.to_thread(
-            keyword_service.index_chunks,
-            chunks=chunks,
-            chunk_ids=chunk_ids,
-            document_id=document_id,
-            file_name=file_name,
-            technology=technology,
-            domain=domain,
-            file_id=document_id,
-            start_chunk_index=0,
+            lambda: keyword_service.index_chunks(
+                chunks=search_chunks,
+                chunk_ids=search_chunk_ids,
+                document_id=document_id,
+                file_name=file_name,
+                technology=technology,
+                domain=domain,
+                file_id=document_id,
+                start_chunk_index=0,
+                chunk_metadata=search_metadata,
+                document_title=file_name,
+            )
         )
 
     try:
         print(">>> STEP 8b: Keyword FTS index (async/thread)...", flush=True)
         await _keyword_index()
-        print(f">>> STEP 8b DONE: Indexed {len(chunks)} chunks for keyword search", flush=True)
+        print(f">>> STEP 8b DONE: Indexed {len(search_chunks)} chunks for keyword search", flush=True)
     except Exception as e:
         logger.warning("Keyword indexing failed: %s", e)
 
     def _mark_ingested():
-        pdf_path_for_registry = (
-            str(file_path) if getattr(settings, "STORE_PDF_AFTER_INGEST", True) else None
-        )
+        pdf_path_for_registry = None
+        if getattr(settings, "STORE_PDF_AFTER_INGEST", True):
+            try:
+                from app.services.blob_storage import upload_document_assets
+
+                pdf_path_for_registry = upload_document_assets(
+                    document_id,
+                    file_path,
+                    settings.UPLOAD_DIR,
+                    blocks,
+                )
+            except Exception as up_err:
+                logger.warning("Supabase asset upload failed: %s", up_err)
+            if not pdf_path_for_registry:
+                pdf_path_for_registry = str(file_path)
         get_document_store().mark_ingested(
             document_id=document_id,
             chunk_count=chunks_created,

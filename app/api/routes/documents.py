@@ -7,7 +7,7 @@ import traceback
 import logging
 
 from fastapi import APIRouter, HTTPException, UploadFile, File
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from app.config import settings
 from app.models.schemas import DocumentInfo, UploadResponse
@@ -40,6 +40,7 @@ from app.services.document_purge import (
     purge_many_documents_async,
     purge_index_data_async,
 )
+from app.services.parent_child_chunks import build_section_parents, split_searchable_for_index
 
 logger = logging.getLogger(__name__)
 
@@ -120,15 +121,45 @@ async def get_document_pdf(document_id: str):
     file_path = resolve_stored_document_path(
         document_id,
         settings.UPLOAD_DIR,
-        preferred_name=doc.get("file_name"),
+        registry_path=doc.get("pdf_path"),
     )
     if not file_path or not file_path.is_file():
-        raise HTTPException(status_code=404, detail="Source file not found on disk")
+        raise HTTPException(status_code=404, detail="Source file not found")
     return FileResponse(
         path=str(file_path),
         media_type=media_type_for_path(file_path),
         filename=doc.get("file_name") or file_path.name,
     )
+
+
+@router.get("/{document_id}/images/page/{page_number}")
+async def get_document_image_by_page(document_id: str, page_number: int):
+    """
+    Serve a cropped figure by PDF page when raw_images row is missing but the
+    file exists under uploads/images/{document_id}/page_{N}_*.png.
+    """
+    from app.services.figure_serving import find_disk_page_image
+
+    path = find_disk_page_image(document_id, page_number)
+    if not path or not path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"No extracted image for page {page_number}",
+        )
+    upload_root = Path(settings.UPLOAD_DIR).resolve()
+    try:
+        path.resolve().relative_to(upload_root)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Invalid image path")
+    ext = path.suffix.lower()
+    media = (
+        "image/png"
+        if ext == ".png"
+        else "image/jpeg"
+        if ext in (".jpg", ".jpeg")
+        else "application/octet-stream"
+    )
+    return FileResponse(path=str(path), media_type=media, filename=path.name)
 
 
 @router.get("/{document_id}/images/{image_id}")
@@ -137,20 +168,16 @@ async def get_document_extracted_image(document_id: str, image_id: str):
     Serve a cropped figure saved during ingest (uploads/images/{document_id}/...).
     Used by chat answers as ![caption](/documents/{document_id}/images/{image_id}).
     """
-    row = get_raw_block_store().get_image(image_id)
-    if not row or row.get("document_id") != document_id:
+    from app.services.figure_serving import resolve_image_file_path
+
+    p = resolve_image_file_path(document_id, image_id)
+    if not p or not p.is_file():
         raise HTTPException(status_code=404, detail="Image not found for this document")
-    path_str = row.get("image_path") or ""
-    if not path_str.strip():
-        raise HTTPException(status_code=404, detail="Image has no file path")
-    p = Path(path_str).resolve()
     upload_root = Path(settings.UPLOAD_DIR).resolve()
     try:
-        p.relative_to(upload_root)
+        p.resolve().relative_to(upload_root)
     except ValueError:
         raise HTTPException(status_code=403, detail="Invalid image path")
-    if not p.is_file():
-        raise HTTPException(status_code=404, detail="Image file not on disk")
     ext = p.suffix.lower()
     media = (
         "image/png"
@@ -266,26 +293,35 @@ async def replace_document(document_id: str, file: UploadFile = File(...)):
         )
         tree_edges.extend(phase2_edges)
 
-        get_document_graph_store().insert_graph(document_id, tree_nodes, tree_edges)
-        chunk_store.insert_chunks(chunks, chunk_metadata, document_id)
-
-        embeddings = _texts_for_embedding(
+        parent_texts, parent_metas = build_section_parents(
             chunks,
             chunk_metadata,
+            document_id=document_id,
+            file_name=file.filename,
+        )
+        get_document_graph_store().insert_graph(document_id, tree_nodes, tree_edges)
+        chunk_store.insert_chunks(chunks + parent_texts, chunk_metadata + parent_metas, document_id)
+
+        search_chunks, search_metadata, search_chunk_ids = split_searchable_for_index(
+            chunks, chunk_metadata
+        )
+        embeddings = _texts_for_embedding(
+            search_chunks,
+            search_metadata,
             document_title=file.filename,
             embedding_service=embedding_service,
         )
 
         chunks_created = vector_store.insert_chunks(
-            chunks=chunks,
+            chunks=search_chunks,
             embeddings=embeddings,
             document_id=document_id,
             file_hash=new_hash,
             file_name=file.filename,
             file_size=len(file_bytes),
-            chunk_metadata=chunk_metadata,
+            chunk_metadata=search_metadata,
             file_id=document_id,
-            chunk_ids=chunk_ids,
+            chunk_ids=search_chunk_ids,
             technology=technology,
             domain=domain,
         )
@@ -294,24 +330,41 @@ async def replace_document(document_id: str, file: UploadFile = File(...)):
             keyword_service = get_keyword_search_service()
             keyword_service.delete_document(document_id)
             keyword_service.index_chunks(
-                chunks=chunks,
-                chunk_ids=chunk_ids,
+                chunks=search_chunks,
+                chunk_ids=search_chunk_ids,
                 document_id=document_id,
                 file_name=file.filename,
                 technology=technology,
                 domain=domain,
                 file_id=document_id,
                 start_chunk_index=0,
+                chunk_metadata=search_metadata,
+                document_title=file.filename,
             )
         except Exception as ke:
             logger.warning("Keyword indexing failed during replace: %s", ke)
 
+        pdf_registry_path = None
+        if getattr(settings, "STORE_PDF_AFTER_INGEST", True):
+            try:
+                from app.services.blob_storage import upload_document_assets
+
+                pdf_registry_path = upload_document_assets(
+                    document_id,
+                    stored_path,
+                    settings.UPLOAD_DIR,
+                    blocks,
+                )
+            except Exception as up_err:
+                logger.warning("Supabase asset upload failed (replace): %s", up_err)
+            if not pdf_registry_path:
+                pdf_registry_path = str(stored_path)
         store.mark_ingested(
             document_id=document_id,
             chunk_count=chunks_created,
             technology=technology,
             domain=domain,
-            pdf_path=str(stored_path) if getattr(settings, "STORE_PDF_AFTER_INGEST", True) else None,
+            pdf_path=pdf_registry_path,
         )
 
         return UploadResponse(

@@ -63,10 +63,15 @@ class Settings(BaseSettings):
     # Keep original PDF and extracted images on disk after ingest (object-storage style).
     STORE_PDF_AFTER_INGEST: bool = True
     STORE_EXTRACTED_IMAGES: bool = True
-    # Optional: OpenAI vision captions for cropped PDF images (uses OPENAI_API_KEY). Costs per image at ingest;
-    # improves retrieval for diagram/architecture/chart questions beyond page-only text.
+    # Vision captions for cropped PDF images at ingest (Groq Llama 4 Scout default). Costs per image.
     ENABLE_VISION_IMAGE_CAPTIONS: bool = False
-    VISION_CAPTION_MODEL: str = "gpt-4o-mini"
+    VISION_PROVIDER: str = "groq"  # groq | openai | gemini
+    # Optional: separate Groq key for vision only; falls back to GROQ_API_KEY when unset
+    GROQ_VISION_API_KEY: Optional[str] = None
+    GROQ_VISION_MODEL: str = "meta-llama/llama-4-scout-17b-16e-instruct"
+    GEMINI_API_KEY: Optional[str] = None
+    GEMINI_VISION_MODEL: str = "gemini-2.0-flash"
+    VISION_CAPTION_MODEL: str = "gpt-4o-mini"  # used when VISION_PROVIDER=openai
     MAX_VISION_CAPTIONS_PER_DOCUMENT: int = 30
 
     # Reranker: fetch a wide pool, score top N with LLM, pass best to answer LLM
@@ -94,6 +99,10 @@ class Settings(BaseSettings):
 
     # Phase 3: prefix chunk text for embeddings (retrieval_text unchanged for display)
     ENABLE_CONTEXTUAL_EMBEDDINGS: bool = True
+    # Keyword FTS: index document/section/page tokens (aligns with vector contextual prefixes)
+    ENABLE_FTS_CONTEXTUAL_INDEX: bool = True
+    # Hybrid retrieval: boost heading chunks when query matches section titles
+    HEADING_RETRIEVAL_BOOST: float = 0.12
     # Optional Anthropic-style one-line context per chunk at ingest (extra LLM cost)
     ENABLE_LLM_CONTEXTUAL_EMBEDDINGS: bool = False
 
@@ -103,6 +112,17 @@ class Settings(BaseSettings):
     CONTEXT_EXPANSION_MAX_ADD: int = 14
     CONTEXT_EXPANSION_SIBLING_MARGIN: float = 0.92
     CONTEXT_EXPANSION_MAX_CHARS: int = 28000
+
+    # Parent–child retrieval (Small-to-Big): search children, send section parent to LLM
+    ENABLE_PARENT_CHILD_RETRIEVAL: bool = True
+    PARENT_SECTION_MAX_CHARS: int = 12000
+    PARENT_CONTEXT_MAX_CHARS: int = 10000
+    # "prepend" = section + matched excerpt; "replace" = section only
+    PARENT_CONTEXT_MODE: str = "prepend"
+    # Max distinct section parents expanded into LLM context per turn
+    PARENT_CONTEXT_MAX_PARENTS: int = 8
+    # Parents with more children than this are treated as document-wide — keep child hits instead
+    PARENT_MEGA_CHILD_THRESHOLD: int = 12
 
     # Upload-time technology/domain tagging
     # MODE: "prompt" = one LLM call (ChatGPT-style) then fallback heuristics on failure;
@@ -121,6 +141,8 @@ class Settings(BaseSettings):
     # Supabase (REST API). If empty or unreachable, app falls back to SQLite (backend/data/chat.db).
     SUPABASE_URL: str = ""
     SUPABASE_KEY: str = ""
+    # Optional: service_role key for Storage uploads (bypasses RLS). Falls back to SUPABASE_KEY.
+    SUPABASE_SERVICE_ROLE_KEY: str = ""
     # Optional: direct PostgreSQL for creating missing tables. Use either SUPABASE_DB_URL
     # or the separate vars below (same as psycopg2.connect(user=..., password=..., host=..., port=..., dbname=...)).
     SUPABASE_DB_URL: str = ""
@@ -129,6 +151,11 @@ class Settings(BaseSettings):
     SUPABASE_DB_HOST: str = ""
     SUPABASE_DB_PORT: str = "5432"
     SUPABASE_DB_NAME: str = "postgres"
+    # Supabase Storage (bucket for PDFs + extracted images; survives Render redeploys)
+    USE_SUPABASE_STORAGE: bool = True
+    SUPABASE_STORAGE_BUCKET: str = "rag-uploads"
+    # S3-compatible endpoint (optional; for AWS CLI — app uses supabase-py REST API)
+    SUPABASE_S3_ENDPOINT: str = ""
 
     class Config:
         env_file = ".env"
@@ -171,6 +198,31 @@ try:
         logger.info(f"OpenAI chat model: {settings.OPENAI_MODEL}")
     logger.info(f"Embedding Model: {settings.OPENAI_EMBEDDING_MODEL}")
     logger.info(f"Zilliz Collection: {settings.ZILLIZ_COLLECTION_NAME}")
+    try:
+        from app.services.blob_storage import storage_enabled, _bucket_name
+
+        if storage_enabled():
+            from app.services.blob_storage import (
+                _bucket_name,
+                ensure_storage_policies,
+                storage_uses_service_role,
+            )
+
+            if storage_uses_service_role():
+                logger.info(
+                    "Blob storage: Supabase bucket=%s (service role key)",
+                    _bucket_name(),
+                )
+            else:
+                ensure_storage_policies()
+                logger.info(
+                    "Blob storage: Supabase bucket=%s (publishable key; policies auto-applied if Postgres URL set)",
+                    _bucket_name(),
+                )
+        else:
+            logger.info("Blob storage: local UPLOAD_DIR only (Supabase storage disabled)")
+    except Exception:
+        pass
     logger.info(
         "Document ingest classify mode: %s",
         getattr(settings, "DOCUMENT_CLASSIFY_MODE", "heuristic"),

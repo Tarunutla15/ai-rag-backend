@@ -301,6 +301,12 @@ def discard_failed_upload(
     except Exception as e:
         logger.warning("discard_failed_upload images: %s", e)
     try:
+        from app.services.blob_storage import delete_document_objects
+
+        delete_document_objects(did)
+    except Exception as e:
+        logger.warning("discard_failed_upload storage: %s", e)
+    try:
         get_document_store().delete_document_row(did)
     except Exception as e:
         logger.warning("discard_failed_upload documents row: %s", e)

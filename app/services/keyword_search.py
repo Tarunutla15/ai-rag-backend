@@ -78,19 +78,37 @@ class KeywordSearchService:
         domain: str,
         file_id: Optional[str] = None,
         start_chunk_index: int = 0,
+        chunk_metadata: Optional[List[Dict]] = None,
+        document_title: str = "",
     ):
         if not chunks:
             return
         if chunk_ids and len(chunk_ids) != len(chunks):
             raise ValueError("chunk_ids length mismatch")
+        if chunk_metadata is not None and len(chunk_metadata) != len(chunks):
+            raise ValueError("chunk_metadata length mismatch")
+
+        from app.config import settings
+        from app.services.contextual_chunk import build_fts_index_text
+
+        use_contextual_fts = getattr(settings, "ENABLE_FTS_CONTEXTUAL_INDEX", True)
 
         if self._use_supabase:
             rows_to_insert = []
             for i, chunk in enumerate(chunks):
                 chunk_id = chunk_ids[i] if chunk_ids else ""
                 idx = str(start_chunk_index + i)
+                meta = chunk_metadata[i] if chunk_metadata and i < len(chunk_metadata) else {}
+                if use_contextual_fts and chunk_metadata:
+                    index_text = meta.get("fts_index_text") or build_fts_index_text(
+                        chunk,
+                        meta,
+                        document_title=document_title or file_name,
+                    )
+                else:
+                    index_text = chunk
                 rows_to_insert.append({
-                    "text": chunk,
+                    "text": index_text,
                     "chunk_id": chunk_id,
                     "document_id": document_id,
                     "file_name": file_name,
@@ -105,7 +123,18 @@ class KeywordSearchService:
             for i, chunk in enumerate(chunks):
                 chunk_id = chunk_ids[i] if chunk_ids else ""
                 idx = str(start_chunk_index + i)
-                rows.append((chunk, chunk_id, document_id, file_name, technology, domain, idx, file_id or ""))
+                meta = chunk_metadata[i] if chunk_metadata and i < len(chunk_metadata) else {}
+                if use_contextual_fts and chunk_metadata:
+                    index_text = meta.get("fts_index_text") or build_fts_index_text(
+                        chunk,
+                        meta,
+                        document_title=document_title or file_name,
+                    )
+                else:
+                    index_text = chunk
+                rows.append(
+                    (index_text, chunk_id, document_id, file_name, technology, domain, idx, file_id or "")
+                )
             with self.db.get_connection() as conn:
                 cur = conn.cursor()
                 cur.executemany(

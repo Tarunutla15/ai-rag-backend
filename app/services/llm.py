@@ -118,11 +118,28 @@ FORMATTING: Use compact Markdown — ## for section titles, short bullet lists, 
                 },
             ]
 
-        valid_chunks = sorted(
-            valid_chunks,
-            key=lambda c: float(c.get("score") or c.get("hybrid_score") or 0.0),
-            reverse=True,
+        def _chunk_sort_key(c: Dict) -> tuple:
+            score = float(c.get("score") or c.get("hybrid_score") or 0.0)
+            is_figure = (c.get("chunk_type") or "").lower() == "image_caption"
+            has_raw_image = bool(c.get("raw_image"))
+            return (0 if is_figure and has_raw_image else 1, -score)
+
+        q_lower = (query or "").lower()
+        seeks_figure = any(
+            v in q_lower
+            for v in (
+                "diagram", "figure", "image", "chart", "graph", "plot", "picture",
+                "show the", "show me", "see the", "view the",
+            )
         )
+        if seeks_figure:
+            valid_chunks = sorted(valid_chunks, key=_chunk_sort_key)
+        else:
+            valid_chunks = sorted(
+                valid_chunks,
+                key=lambda c: float(c.get("score") or c.get("hybrid_score") or 0.0),
+                reverse=True,
+            )
 
         max_context_chars: Optional[int] = None
         max_per_chunk: Optional[int] = None

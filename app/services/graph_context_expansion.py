@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from app.config import settings
 from app.services.chunk_store import get_chunk_store
 from app.services.document_graph_store import get_document_graph_store
+from app.services.parent_child_chunks import CHUNK_TYPE_SECTION_PARENT
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +273,8 @@ def expand_context_graph(
     for cid in to_fetch:
         row = rows.get(cid)
         if not row:
+            continue
+        if (row.get("chunk_type") or "").lower() == CHUNK_TYPE_SECTION_PARENT:
             continue
         best_seed = max_seed
         link_score = best_seed * decay

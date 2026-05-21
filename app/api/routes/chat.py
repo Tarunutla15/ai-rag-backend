@@ -3,7 +3,7 @@ import asyncio
 import logging
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -248,6 +248,20 @@ def _apply_retrieval_relevance_tuning(chunks: list, topic_terms: list) -> list:
             )
             if hits:
                 score += 0.14 * hits
+        chunk_type = (c.get("chunk_type") or "").lower()
+        if chunk_type == "heading" and topic_terms:
+            heading_boost = float(getattr(settings, "HEADING_RETRIEVAL_BOOST", 0.12))
+            if any(
+                term in title or term in text or f"{term}s" in text
+                for term in topic_terms
+            ):
+                score += heading_boost
+        metadata_json = c.get("metadata_json") or ""
+        if topic_terms and metadata_json:
+            meta_lower = metadata_json.lower() if isinstance(metadata_json, str) else ""
+            path_hits = sum(1 for term in topic_terms if term in meta_lower)
+            if path_hits:
+                score += 0.06 * path_hits
         if _looks_like_toc_excerpt(c.get("text") or ""):
             score *= 0.45
         c["hybrid_score"] = score
@@ -703,7 +717,7 @@ def _query_seeks_figure_or_image(query: str) -> bool:
         return False
     visual = (
         "image", "figure", "diagram", "picture", "chart", "graph", "plot",
-        "screenshot", "illustration", "show me", "see the", "view the",
+        "screenshot", "illustration", "show me", "show the", "see the", "view the",
         "display the", "can i see",
     )
     if not any(v in q for v in visual):
@@ -769,6 +783,17 @@ def _maybe_supplement_image_caption_chunks(
         return context_chunks
     logger.info(">>> RETRIEVAL: supplemented %s image_caption chunks for figure/image query", len(added))
     return list(context_chunks) + added
+
+
+def _resolve_parent_context(context_chunks: list) -> list:
+    """Hierarchical retrieval: replace child snippets with section parent context."""
+    if not context_chunks:
+        return context_chunks
+    if not getattr(settings, "ENABLE_PARENT_CHILD_RETRIEVAL", True):
+        return context_chunks
+    from app.services.parent_context_resolution import resolve_parent_context
+
+    return resolve_parent_context(context_chunks)
 
 
 def _expand_context_graph(
@@ -849,15 +874,34 @@ def _hydrate_chunks(context_chunks: list) -> list:
                 c["raw_code"] = raw_store.get_code(raw_id)
         elif chunk_type == "image_caption":
             raw_id = meta.get("raw_image_id")
+            img = None
             if raw_id:
                 img = raw_store.get_image(raw_id)
-                if img:
-                    img = dict(img)
-                    did = img.get("document_id")
-                    iid = img.get("image_id")
-                    if did and iid:
-                        img["view_url"] = f"/documents/{did}/images/{iid}"
-                    c["raw_image"] = img
+            from app.services.figure_serving import (
+                build_figure_dict,
+                hydrate_raw_image_fallback,
+            )
+
+            if img:
+                img = dict(img)
+                did = (img.get("document_id") or c.get("document_id") or "").strip()
+                fig = build_figure_dict(
+                    document_id=did,
+                    page_number=img.get("page_number") or c.get("page_number"),
+                    image_id=img.get("image_id"),
+                    caption=img.get("caption") or c.get("text") or "",
+                    existing_view_url=img.get("view_url"),
+                    image_path=img.get("image_path"),
+                )
+                if fig:
+                    img.update(fig)
+                c["raw_image"] = img
+            else:
+                fallback = hydrate_raw_image_fallback(
+                    c, document_id=c.get("document_id")
+                )
+                if fallback:
+                    c["raw_image"] = fallback
 
     return context_chunks
 
@@ -871,8 +915,236 @@ def _sources_from_chunks(context_chunks: list) -> list:
     return list(sources)[:10]
 
 
+def _figure_relevance_score(chunk: Dict[str, Any], query: str) -> float:
+    from app.services.figure_serving import _query_figure_relevance_score
+
+    base = float(chunk.get("score") or chunk.get("hybrid_score") or 0.0)
+    text = (chunk.get("text") or "") + " " + (chunk.get("raw_image") or {}).get(
+        "caption", ""
+    )
+    if (chunk.get("chunk_type") or "").lower() != "image_caption":
+        return base - 2.0 + _query_figure_relevance_score(text, query) * 0.5
+    return base + _query_figure_relevance_score(text, query)
+
+
+def _figure_row_from_raw_image(
+    raw: Dict[str, Any],
+    *,
+    fallback_text: str = "",
+    page_number: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build a figure dict with a view_url that serves from disk when possible."""
+    from app.services.figure_serving import build_figure_dict
+
+    did = (raw.get("document_id") or "").strip()
+    if not did:
+        return None
+    return build_figure_dict(
+        document_id=did,
+        page_number=page_number if page_number is not None else raw.get("page_number"),
+        image_id=raw.get("image_id"),
+        caption=(raw.get("caption") or fallback_text or "Figure from document"),
+        existing_view_url=raw.get("view_url"),
+        image_path=raw.get("image_path"),
+    )
+
+
+def _figures_from_context_chunks(context_chunks: list, query: str = "") -> list:
+    """Build figure payloads from hydrated retrieval hits (best match only)."""
+    seen_pages: set = set()
+    seen_urls: set = set()
+    figures: list = []
+    candidates = [
+        c
+        for c in context_chunks
+        if (c.get("raw_image") or {}).get("view_url")
+        or (c.get("raw_image") or {}).get("image_id")
+    ]
+    candidates.sort(key=lambda c: _figure_relevance_score(c, query), reverse=True)
+    for c in candidates:
+        raw = c.get("raw_image") or {}
+        fig = _figure_row_from_raw_image(
+            raw,
+            fallback_text=(c.get("text") or ""),
+            page_number=c.get("page_number"),
+        )
+        if not fig or not fig.get("view_url"):
+            continue
+        page_key = (fig.get("document_id"), fig.get("page_number"))
+        if page_key in seen_pages:
+            continue
+        view_url = fig["view_url"]
+        if view_url in seen_urls:
+            continue
+        seen_pages.add(page_key)
+        seen_urls.add(view_url)
+        figures.append(fig)
+        if len(figures) >= 1:
+            break
+    return figures
+
+
+def _figures_from_scoped_documents(scope_file_ids: list, query: str = "") -> list:
+    """
+    Load all image_caption chunks for scoped documents (fallback when retrieval
+    hits do not carry raw_image on the in-memory chunk dict).
+    """
+    if not scope_file_ids:
+        return []
+    chunk_store = get_chunk_store()
+    raw_store = get_raw_block_store()
+    seen: set = set()
+    figures: list = []
+    q = (query or "").lower()
+
+    for did in _cap_scope_document_ids(scope_file_ids)[:5]:
+        try:
+            rows = chunk_store.list_chunks_by_type(did, "image_caption", limit=25)
+        except Exception as e:
+            logger.warning(">>> FIGURES: list image_caption failed doc=%s: %s", did[:8], e)
+            continue
+
+        def _row_score(row: Dict[str, Any]) -> float:
+            text = (row.get("retrieval_text") or "").lower()
+            score = 0.1
+            for term in re.findall(r"[a-z]{4,}", q):
+                if term in text:
+                    score += 0.4
+            if "visual description" in text:
+                score += 0.3
+            if "lifecycle" in q and "lifecycle" in text:
+                score += 0.5
+            if "diagram" in q and "diagram" in text:
+                score += 0.5
+            try:
+                score += max(0, 0.05 * int(row.get("page_number") or 0))
+            except (TypeError, ValueError):
+                pass
+            return score
+
+        rows.sort(key=_row_score, reverse=True)
+        for row in rows:
+            meta: Dict[str, Any] = {}
+            try:
+                meta = json.loads(row.get("metadata_json") or "{}")
+            except Exception:
+                meta = {}
+            raw_id = meta.get("raw_image_id")
+            if not raw_id:
+                continue
+            img = raw_store.get_image(raw_id)
+            fig = None
+            if img:
+                fig = _figure_row_from_raw_image(
+                    img,
+                    fallback_text=row.get("retrieval_text") or "",
+                    page_number=row.get("page_number"),
+                )
+            if not fig:
+                from app.services.figure_serving import figure_from_page
+
+                page = row.get("page_number")
+                doc_id = row.get("document_id") or did
+                if page is not None:
+                    fig = figure_from_page(
+                        doc_id,
+                        int(page),
+                        caption=row.get("retrieval_text") or "",
+                        image_id=raw_id,
+                    )
+            page_key = (fig.get("document_id"), fig.get("page_number"))
+            if not fig or fig["view_url"] in seen or page_key in seen:
+                continue
+            seen.add(fig["view_url"])
+            seen.add(page_key)
+            figures.append(fig)
+            if len(figures) >= 1:
+                return figures
+    if not figures:
+        from app.services.figure_serving import figures_from_disk
+
+        figures = figures_from_disk(
+            _cap_scope_document_ids(scope_file_ids),
+            query=query,
+            max_figures=1,
+        )
+    return figures
+
+
+def _resolve_figures_for_query(
+    context_chunks: list,
+    scope_file_ids: list,
+    query: str,
+) -> list:
+    """Prefer hydrated retrieval hits; fall back to all image_caption rows in scope."""
+    figures = _figures_from_context_chunks(context_chunks, query=query)
+    if not figures and _query_seeks_figure_or_image(query):
+        figures = _figures_from_scoped_documents(scope_file_ids, query=query)
+    if not figures and _query_seeks_figure_or_image(query) and scope_file_ids:
+        from app.services.figure_serving import figures_from_disk
+
+        figures = figures_from_disk(
+            _cap_scope_document_ids(scope_file_ids), query=query, max_figures=1
+        )
+    if _query_seeks_figure_or_image(query):
+        logger.info(
+            ">>> FIGURES: resolved %s for query (context_hits_with_raw_image=%s)",
+            len(figures),
+            sum(1 for c in context_chunks if (c.get("raw_image") or {}).get("image_id")),
+        )
+    return figures
+
+
+def _answer_has_embedded_document_image(answer: str) -> bool:
+    """True only when answer already embeds our API image route (not external URLs)."""
+    return bool(
+        re.search(
+            r"!\[[^\]]*\]\(/documents/[^)/\s]+/images/(?:page/\d+|[^)/\s]+)\)",
+            answer or "",
+        )
+    )
+
+
+def _ensure_document_figures_in_answer(answer: str, figures: list, query: str) -> str:
+    """
+    When the user asked to see a diagram, append Markdown image lines for stored figures
+    if the LLM omitted them (e.g. linked an external URL from PDF text instead).
+    """
+    if not figures or not _query_seeks_figure_or_image(query):
+        return answer
+    if _answer_has_embedded_document_image(answer):
+        return answer
+    lines = ["\n\n## Diagram from your document\n"]
+    for fig in figures[:1]:
+        alt = "Figure"
+        cap = (fig.get("caption") or "").strip()
+        if cap:
+            alt = cap[:120] + ("…" if len(cap) > 120 else "")
+        lines.append(f"![{alt}]({fig['view_url']})")
+    return (answer or "").rstrip() + "\n".join(lines)
+
+
 def _sse_payload(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+def _friendly_stream_llm_error(exc: Exception) -> str:
+    """Short user-facing message for SSE error events."""
+    msg = str(exc) or type(exc).__name__
+    low = msg.lower()
+    if "rate_limit" in low or "429" in msg:
+        if "tokens per day" in low or "tpd" in low:
+            return (
+                "Groq daily token limit reached for this API key. "
+                "Wait about 40 minutes, switch LLM_PROVIDER=openai in .env, or upgrade Groq billing."
+            )
+        return (
+            "Groq rate limit hit (too many requests). Wait a minute and try again, "
+            "or reduce RERANK / context size in .env."
+        )
+    if "413" in msg or "too large" in low or "request too large" in low:
+        return "Prompt too large for Groq. Lower GROQ_MAX_CONTEXT_CHARS or scope fewer documents."
+    return msg[:800]
 
 
 async def _rag_turn_async(request: ChatRequest) -> dict:
@@ -1179,6 +1451,9 @@ async def _rag_turn_async(request: ChatRequest) -> dict:
     # Hydrate chunks with raw data (tables/code/images)
     context_chunks = await asyncio.to_thread(_hydrate_chunks, context_chunks)
 
+    # Parent–child: child hit → section parent text for LLM (Small-to-Big)
+    context_chunks = await asyncio.to_thread(_resolve_parent_context, context_chunks)
+
     # Chat history for context window
     chat_history = chat_service.get_context_messages(session_id, context_window=6)
     available_technologies = get_document_store().get_technologies()
@@ -1197,6 +1472,7 @@ async def _rag_turn_async(request: ChatRequest) -> dict:
             "query": query,
             "technologies": technologies,
             "domain": domain,
+            "scope_file_ids": scope_file_ids,
             "context_chunks": context_chunks,
             "chat_service": chat_service,
             "chat_history": chat_history,
@@ -1209,6 +1485,7 @@ async def _rag_turn_async(request: ChatRequest) -> dict:
         "query": query,
         "technologies": technologies,
         "domain": domain,
+        "scope_file_ids": scope_file_ids,
         "context_chunks": context_chunks,
         "chat_service": chat_service,
         "chat_history": chat_history,
@@ -1275,11 +1552,14 @@ def _record_llm_usage(
     )
 
 
-def _chat_response_from_turn(turn: dict, answer: str) -> ChatResponse:
+def _chat_response_from_turn(turn: dict, answer: str, query: str = "") -> ChatResponse:
     technologies = turn.get("technologies") or []
     domain = turn.get("domain")
     context_chunks = turn.get("context_chunks") or []
+    scope_file_ids = turn.get("scope_file_ids") or []
     sources = _sources_from_chunks(context_chunks)
+    figures = _resolve_figures_for_query(context_chunks, scope_file_ids, query)
+    answer = _ensure_document_figures_in_answer(answer, figures, query)
     detected_technology_str = ", ".join(technologies) if technologies else None
     return ChatResponse(
         answer=answer,
@@ -1287,6 +1567,7 @@ def _chat_response_from_turn(turn: dict, answer: str) -> ChatResponse:
         sources=sources if sources else None,
         detected_technology=detected_technology_str,
         detected_domain=domain,
+        figures=figures if figures else None,
     )
 
 
@@ -1301,7 +1582,7 @@ async def chat(request: ChatRequest):
     if turn.get("insufficient_answer"):
         answer = turn["insufficient_answer"]
         chat_service.add_message(session_id, "assistant", answer)
-        return _chat_response_from_turn(turn, answer)
+        return _chat_response_from_turn(turn, answer, query=query)
 
     llm_service = get_llm_service()
     answer = llm_service.generate_response(
@@ -1318,7 +1599,7 @@ async def chat(request: ChatRequest):
         llm_service=llm_service,
     )
     logger.info(">>> CHAT: done session_id=%s", session_id[:8] + "...")
-    return _chat_response_from_turn(turn, answer)
+    return _chat_response_from_turn(turn, answer, query=query)
 
 
 @router.post("/stream")
@@ -1331,6 +1612,11 @@ async def chat_stream(request: ChatRequest):
     technologies = turn.get("technologies") or []
     domain = turn.get("domain")
     detected_technology_str = ", ".join(technologies) if technologies else None
+    scope_file_ids = turn.get("scope_file_ids") or []
+    context_chunks_for_figures = turn.get("context_chunks") or []
+    stream_figures = _resolve_figures_for_query(
+        context_chunks_for_figures, scope_file_ids, query
+    )
 
     async def event_generator():
         meta = {
@@ -1338,6 +1624,7 @@ async def chat_stream(request: ChatRequest):
             "session_id": session_id,
             "detected_technology": detected_technology_str,
             "detected_domain": domain,
+            "figures": stream_figures if stream_figures else None,
         }
         yield _sse_payload(meta)
 
@@ -1370,10 +1657,18 @@ async def chat_stream(request: ChatRequest):
                 yield _sse_payload({"type": "token", "content": delta})
         except Exception as e:
             logger.exception(">>> CHAT STREAM: LLM error: %s", e)
-            yield _sse_payload({"type": "error", "detail": str(e)})
+            yield _sse_payload(
+                {"type": "error", "detail": _friendly_stream_llm_error(e)}
+            )
             return
 
         answer = "".join(parts).strip()
+        figures = stream_figures or _resolve_figures_for_query(
+            turn.get("context_chunks") or [],
+            scope_file_ids,
+            query,
+        )
+        answer = _ensure_document_figures_in_answer(answer, figures, query)
         assistant_row = chat_service.add_message(session_id, "assistant", answer)
         _record_llm_usage(
             session_id=session_id,
@@ -1381,7 +1676,9 @@ async def chat_stream(request: ChatRequest):
             query=query,
             llm_service=llm_service,
         )
-        sources = _sources_from_chunks(turn["context_chunks"])
+        sources = _sources_from_chunks(turn.get("context_chunks") or [])
+        if figures:
+            logger.info(">>> CHAT STREAM: attaching %s document figure(s) to reply", len(figures))
         logger.info(">>> CHAT STREAM: done session_id=%s", session_id[:8] + "...")
         yield _sse_payload(
             {
@@ -1391,6 +1688,7 @@ async def chat_stream(request: ChatRequest):
                 "sources": sources if sources else None,
                 "detected_technology": detected_technology_str,
                 "detected_domain": domain,
+                "figures": figures if figures else None,
             }
         )
 

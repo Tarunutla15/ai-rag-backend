@@ -51,6 +51,24 @@ def _format_section_path(meta: Dict[str, Any]) -> str:
     return title
 
 
+def _format_subsection_title(meta: Dict[str, Any]) -> str:
+    """Innermost section/heading label (retrieval anchor)."""
+    path = meta.get("section_path")
+    if isinstance(path, list) and path:
+        return str(path[-1]).strip()
+    return (meta.get("section_title") or meta.get("parent_section_title") or "").strip()
+
+
+def _format_page_line(meta: Dict[str, Any]) -> str:
+    try:
+        page = int(meta.get("page_number", -1))
+    except (TypeError, ValueError):
+        page = -1
+    if page > 0:
+        return f"[Page: {page}]"
+    return ""
+
+
 def _format_related_line(meta: Dict[str, Any], labels: Dict[str, str]) -> str:
     parts: List[str] = []
     cid = meta.get("chunk_id")
@@ -96,8 +114,19 @@ def build_embedding_text(
     if section:
         lines.append(f"[Section: {section}]")
 
+    subsection = _format_subsection_title(meta)
+    page_line = _format_page_line(meta)
+    if page_line:
+        lines.append(page_line)
+
     chunk_type = (meta.get("chunk_type") or "paragraph").lower()
     lines.append(f"[Type: {chunk_type}]")
+
+    body = (retrieval_text or "").strip()
+    if chunk_type == "heading" and body:
+        lines.append(f"[Heading: {body}]")
+        if subsection and subsection.lower() != body.lower():
+            lines.append(f"[Subsection: {subsection}]")
 
     related = _format_related_line(meta, labels)
     if related:
@@ -106,11 +135,65 @@ def build_embedding_text(
     if llm_context_line and llm_context_line.strip():
         lines.append(f"[Context: {llm_context_line.strip()[:400]}]")
 
-    body = (retrieval_text or "").strip()
     if not body:
         body = "(empty)"
     lines.append(body)
     return "\n".join(lines)
+
+
+def build_fts_index_text(
+    retrieval_text: str,
+    meta: Dict[str, Any],
+    *,
+    document_title: str = "",
+) -> str:
+    """
+    Enriched text for keyword/FTS index — aligns with vector embedding context.
+
+    Plain tokens (no brackets) so Supabase ILIKE matches section titles and document names.
+    """
+    parts: List[str] = []
+    doc_name = (document_title or meta.get("file_name") or "").strip()
+    if doc_name:
+        parts.append(doc_name)
+
+    path = meta.get("section_path")
+    if isinstance(path, list):
+        for segment in path:
+            seg = str(segment).strip()
+            if seg:
+                parts.append(seg)
+
+    section = _format_section_path(meta)
+    if section and section not in parts:
+        parts.append(section)
+
+    subsection = _format_subsection_title(meta)
+    if subsection and subsection not in parts:
+        parts.append(subsection)
+
+    parent_title = (meta.get("parent_section_title") or "").strip()
+    if parent_title and parent_title not in parts:
+        parts.append(parent_title)
+
+    try:
+        page = int(meta.get("page_number", -1))
+    except (TypeError, ValueError):
+        page = -1
+    if page > 0:
+        parts.append(f"page {page}")
+
+    chunk_type = (meta.get("chunk_type") or "paragraph").lower()
+    parts.append(chunk_type)
+
+    body = (retrieval_text or "").strip()
+    if chunk_type == "heading" and body:
+        # Repeat heading text so section-title queries rank strongly in ILIKE search
+        parts.extend([body, body])
+    elif body:
+        parts.append(body)
+
+    return "\n".join(parts)
 
 
 def build_embedding_texts_for_chunks(
@@ -133,5 +216,23 @@ def build_embedding_texts_for_chunks(
             llm_context_line=llm_ctx.get(meta.get("chunk_id") or ""),
         )
         meta["embedding_text"] = emb
+        meta["fts_index_text"] = build_fts_index_text(
+            text, meta, document_title=document_title
+        )
         out.append(emb)
+    return out
+
+
+def build_fts_index_texts_for_chunks(
+    chunks: List[str],
+    metadata_list: List[Dict[str, Any]],
+    *,
+    document_title: str = "",
+) -> List[str]:
+    """FTS strings with hierarchy tokens; sets meta['fts_index_text']."""
+    out: List[str] = []
+    for text, meta in zip(chunks, metadata_list):
+        fts = build_fts_index_text(text, meta, document_title=document_title)
+        meta["fts_index_text"] = fts
+        out.append(fts)
     return out

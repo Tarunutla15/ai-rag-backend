@@ -41,6 +41,14 @@ def resolve_stored_document_path(
         p = Path(registry_path)
         if p.is_file():
             return p
+    try:
+        from app.services.blob_storage import resolve_registry_path_to_local
+
+        remote = resolve_registry_path_to_local(document_id, registry_path, upload_dir)
+        if remote and remote.is_file():
+            return remote
+    except Exception:
+        pass
     return None
 
 
@@ -88,3 +96,5 @@ class DocumentProcessor:
             DOCXProcessor.persist_extracted_images(
                 file_path, document_id, blocks, upload_dir
             )
+        # Image upload to Supabase happens once in ingest_pipeline.upload_document_assets
+        # (avoids duplicate uploads + RLS error spam during extraction).

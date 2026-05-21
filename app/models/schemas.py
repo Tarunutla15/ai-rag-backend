@@ -74,6 +74,15 @@ class ChatRequest(BaseModel):
     file_ids: Optional[List[str]] = None
 
 
+class ChatFigure(BaseModel):
+    """Extracted PDF figure served from /documents/{document_id}/images/{image_id}."""
+    image_id: Optional[str] = None
+    document_id: Optional[str] = None
+    view_url: str
+    caption: Optional[str] = None
+    page_number: Optional[int] = None
+
+
 class ChatResponse(BaseModel):
     """Response model for chat query."""
     answer: str
@@ -81,6 +90,7 @@ class ChatResponse(BaseModel):
     sources: Optional[List[str]] = None
     detected_technology: Optional[str] = None
     detected_domain: Optional[str] = None
+    figures: Optional[List[ChatFigure]] = None
 
 
 class HealthResponse(BaseModel):

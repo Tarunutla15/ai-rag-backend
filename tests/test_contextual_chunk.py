@@ -3,6 +3,7 @@ from app.services.contextual_chunk import (
     build_chunk_display_labels,
     build_embedding_text,
     build_embedding_texts_for_chunks,
+    build_fts_index_text,
 )
 
 
@@ -23,6 +24,33 @@ def test_build_embedding_text_includes_structure():
     assert "[Section: Transformer Architecture > Multi-Head Attention]" in text
     assert "[Type: paragraph]" in text
     assert "Multi-head attention" in text
+
+
+def test_build_embedding_text_includes_page_and_heading_anchor():
+    meta = {
+        "chunk_id": "h1",
+        "chunk_type": "heading",
+        "section_path": ["Expense Module", "Upload Receipt"],
+        "page_number": 5,
+        "file_name": "guide.docx",
+    }
+    text = build_embedding_text("Upload Receipt", meta, document_title="Travel Guide")
+    assert "[Page: 5]" in text
+    assert "[Heading: Upload Receipt]" in text
+    assert "[Section: Expense Module > Upload Receipt]" in text
+
+
+def test_build_fts_index_text_repeats_heading_for_search():
+    meta = {
+        "chunk_type": "heading",
+        "section_path": ["Request Advance"],
+        "page_number": 3,
+        "file_name": "policy.docx",
+    }
+    fts = build_fts_index_text("Request Advance", meta, document_title="Travel Policy")
+    assert fts.count("Request Advance") >= 2
+    assert "page 3" in fts
+    assert "Request Advance" in fts
 
 
 def test_related_line_in_embedding_text():
