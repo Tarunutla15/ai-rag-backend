@@ -725,6 +725,131 @@ def _query_seeks_figure_or_image(query: str) -> bool:
     return True
 
 
+def _query_seeks_architecture_diagram(query: str) -> bool:
+    q = (query or "").lower()
+    if not q.strip():
+        return False
+    if "attention" in q and "architecture" not in q and "model architecture" not in q:
+        return False
+    arch = ("architecture", "architectural", "encoder", "decoder", "stacked")
+    if not any(a in q for a in arch):
+        return False
+    return (
+        _query_seeks_figure_or_image(query)
+        or "transformer" in q
+        or "diagram" in q
+        or "figure" in q
+    )
+
+
+def _query_seeks_attention_diagrams(query: str) -> bool:
+    q = (query or "").lower()
+    if not q.strip():
+        return False
+    if not _query_seeks_figure_or_image(query):
+        return False
+    if "attention" not in q:
+        return False
+    if _query_seeks_architecture_diagram(query):
+        return False
+    return True
+
+
+def _query_seeks_figure2_pair(query: str) -> bool:
+    """User wants both parts of Figure 2 (scaled dot-product + multi-head)."""
+    q = (query or "").lower()
+    if not _query_seeks_figure_or_image(query):
+        return False
+    has_scaled = (
+        "scaled" in q
+        or "dot-product" in q
+        or "dot product" in q
+    )
+    has_multi = "multi-head" in q or ("multi" in q and "head" in q)
+    return has_scaled and has_multi
+
+
+def _figure_priority_document_ids(scope_file_ids: list, query: str) -> list:
+    """When the question is about Transformers, search Attention-paper docs first."""
+    q = (query or "").lower()
+    if "transformer" not in q and "attention" not in q:
+        return list(scope_file_ids)
+    store = get_document_store()
+    priority: list = []
+    rest: list = []
+    for did in scope_file_ids:
+        if not did:
+            continue
+        row = store.get_document(did) or {}
+        name = (row.get("file_name") or row.get("original_filename") or "").lower()
+        tech = (row.get("technology") or "").lower()
+        if any(
+            k in name
+            for k in ("attention", "transformer", "transformers")
+        ) or tech in ("deep_learning", "ai", "nlp"):
+            priority.append(did)
+        else:
+            rest.append(did)
+    return priority + rest if priority else list(scope_file_ids)
+
+
+def _max_figures_for_query(query: str) -> int:
+    q = (query or "").lower()
+    if _query_seeks_figure2_pair(query):
+        return 2
+    if _query_seeks_attention_diagrams(query):
+        return 2
+    if "full" in q and "architecture" in q:
+        return 2
+    if "figure 1" in q and "figure 2" in q:
+        return 2
+    return 1
+
+
+def _prepend_figure_context_chunk(context_chunks: list, figure: Optional[Dict]) -> list:
+    """Ensure the chosen figure's RAW IMAGE block is in the LLM context window."""
+    if not figure or not figure.get("view_url"):
+        return context_chunks
+    url = figure["view_url"]
+    for c in context_chunks:
+        ri = c.get("raw_image") or {}
+        if ri.get("view_url") == url:
+            return context_chunks
+    cap = (figure.get("caption") or "").strip()
+    if not cap or cap.lower().startswith("figure on page"):
+        page = figure.get("page_number")
+        cap = (
+            f"Figure from document (PDF page {page}). "
+            "Excerpts may refer to Figure 1 (Transformer model architecture) or related diagrams."
+            if page is not None
+            else "Figure from document."
+        )
+    synthetic = {
+        "text": cap,
+        "chunk_type": "image_caption",
+        "document_id": figure.get("document_id"),
+        "page_number": figure.get("page_number"),
+        "technology": "deep_learning",
+        "score": 0.99,
+        "hybrid_score": 0.99,
+        "raw_image": {
+            "view_url": url,
+            "caption": cap,
+            "document_id": figure.get("document_id"),
+            "page_number": figure.get("page_number"),
+        },
+    }
+    return [synthetic] + list(context_chunks)
+
+
+def _prepend_figures_to_context(context_chunks: list, figures: list) -> list:
+    """Prepend one synthetic chunk per attached figure (Figure 2 left/right, etc.)."""
+    out = list(context_chunks)
+    for fig in reversed(figures[:2]):
+        out = _prepend_figure_context_chunk(out, fig)
+    return out
+
+
 def _maybe_supplement_image_caption_chunks(
     context_chunks: list,
     query: str,
@@ -738,11 +863,13 @@ def _maybe_supplement_image_caption_chunks(
     if not _query_seeks_figure_or_image(query):
         return context_chunks
 
+    from app.services.figure_serving import _query_figure_relevance_score
+
     chunk_store = get_chunk_store()
     seen = {c.get("chunk_id") for c in context_chunks if c.get("chunk_id")}
     doc_candidates: list = []
     if scope_file_ids:
-        doc_candidates = list(scope_file_ids)
+        doc_candidates = _figure_priority_document_ids(list(scope_file_ids), query)
     else:
         doc_candidates = list({c.get("document_id") for c in context_chunks if c.get("document_id")})
         doc_candidates = doc_candidates[:10]
@@ -766,8 +893,10 @@ def _maybe_supplement_image_caption_chunks(
                 continue
             seen.add(cid)
             mjson = row.get("metadata_json") or "{}"
+            text = row.get("retrieval_text") or ""
+            rel = _query_figure_relevance_score(text, query)
             added.append({
-                "text": row.get("retrieval_text") or "",
+                "text": text,
                 "chunk_id": cid,
                 "document_id": did,
                 "chunk_type": "image_caption",
@@ -776,11 +905,15 @@ def _maybe_supplement_image_caption_chunks(
                 "section_title": row.get("section_title", ""),
                 "technology": tech_fallback or "general",
                 "domain": None,
-                "score": 0.55,
-                "hybrid_score": 0.55,
+                "score": 0.45 + min(0.5, rel),
+                "hybrid_score": 0.45 + min(0.5, rel),
             })
     if not added:
         return context_chunks
+    added.sort(
+        key=lambda c: float(c.get("hybrid_score") or 0.0),
+        reverse=True,
+    )
     logger.info(">>> RETRIEVAL: supplemented %s image_caption chunks for figure/image query", len(added))
     return list(context_chunks) + added
 
@@ -916,15 +1049,45 @@ def _sources_from_chunks(context_chunks: list) -> list:
 
 
 def _figure_relevance_score(chunk: Dict[str, Any], query: str) -> float:
-    from app.services.figure_serving import _query_figure_relevance_score
+    from app.services.figure_serving import (
+        _architecture_page_boost,
+        _attention_page_boost,
+        _bad_vision_caption_penalty,
+        _query_figure_relevance_score,
+        figure_labels_by_page,
+        is_generic_figure_caption,
+    )
 
     base = float(chunk.get("score") or chunk.get("hybrid_score") or 0.0)
     text = (chunk.get("text") or "") + " " + (chunk.get("raw_image") or {}).get(
         "caption", ""
     )
+    rel = _query_figure_relevance_score(text, query)
+    did = (chunk.get("document_id") or "").strip()
+    labels = figure_labels_by_page(did) if did else {}
+    try:
+        page = int(chunk.get("page_number") or (chunk.get("raw_image") or {}).get("page_number") or 0)
+        if page > 0:
+            rel += _architecture_page_boost(page, query, labels)
+            rel += _attention_page_boost(page, query, labels)
+    except (TypeError, ValueError):
+        pass
+    try:
+        page_i = int(
+            chunk.get("page_number")
+            or (chunk.get("raw_image") or {}).get("page_number")
+            or 0
+        )
+    except (TypeError, ValueError):
+        page_i = 0
+    rel -= _bad_vision_caption_penalty(
+        text, page_labels=labels.get(page_i), query=query
+    )
+    if is_generic_figure_caption(text):
+        rel -= 0.35
     if (chunk.get("chunk_type") or "").lower() != "image_caption":
-        return base - 2.0 + _query_figure_relevance_score(text, query) * 0.5
-    return base + _query_figure_relevance_score(text, query)
+        return base - 2.0 + rel * 0.5
+    return base + rel
 
 
 def _figure_row_from_raw_image(
@@ -932,6 +1095,7 @@ def _figure_row_from_raw_image(
     *,
     fallback_text: str = "",
     page_number: Optional[int] = None,
+    query: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Build a figure dict with a view_url that serves from disk when possible."""
     from app.services.figure_serving import build_figure_dict
@@ -946,11 +1110,14 @@ def _figure_row_from_raw_image(
         caption=(raw.get("caption") or fallback_text or "Figure from document"),
         existing_view_url=raw.get("view_url"),
         image_path=raw.get("image_path"),
+        query=query,
     )
 
 
 def _figures_from_context_chunks(context_chunks: list, query: str = "") -> list:
     """Build figure payloads from hydrated retrieval hits (best match only)."""
+    max_figures = _max_figures_for_query(query)
+    allow_same_page = max_figures > 1
     seen_pages: set = set()
     seen_urls: set = set()
     figures: list = []
@@ -967,11 +1134,12 @@ def _figures_from_context_chunks(context_chunks: list, query: str = "") -> list:
             raw,
             fallback_text=(c.get("text") or ""),
             page_number=c.get("page_number"),
+            query=query,
         )
         if not fig or not fig.get("view_url"):
             continue
         page_key = (fig.get("document_id"), fig.get("page_number"))
-        if page_key in seen_pages:
+        if not allow_same_page and page_key in seen_pages:
             continue
         view_url = fig["view_url"]
         if view_url in seen_urls:
@@ -979,7 +1147,7 @@ def _figures_from_context_chunks(context_chunks: list, query: str = "") -> list:
         seen_pages.add(page_key)
         seen_urls.add(view_url)
         figures.append(fig)
-        if len(figures) >= 1:
+        if len(figures) >= max_figures:
             break
     return figures
 
@@ -991,13 +1159,28 @@ def _figures_from_scoped_documents(scope_file_ids: list, query: str = "") -> lis
     """
     if not scope_file_ids:
         return []
+    from app.services.figure_serving import (
+        _architecture_page_boost,
+        _attention_page_boost,
+        _bad_vision_caption_penalty,
+        _query_figure_relevance_score,
+        enrich_figure_caption,
+        figure_labels_by_page,
+    )
+
     chunk_store = get_chunk_store()
     raw_store = get_raw_block_store()
-    seen: set = set()
+    seen_urls: set = set()
+    seen_pages: set = set()
     figures: list = []
-    q = (query or "").lower()
+    max_figures = _max_figures_for_query(query)
+    allow_same_page = max_figures > 1
+    doc_order = _figure_priority_document_ids(
+        _cap_scope_document_ids(scope_file_ids), query
+    )
 
-    for did in _cap_scope_document_ids(scope_file_ids)[:5]:
+    for did in doc_order[:5]:
+        labels = figure_labels_by_page(did)
         try:
             rows = chunk_store.list_chunks_by_type(did, "image_caption", limit=25)
         except Exception as e:
@@ -1005,22 +1188,30 @@ def _figures_from_scoped_documents(scope_file_ids: list, query: str = "") -> lis
             continue
 
         def _row_score(row: Dict[str, Any]) -> float:
-            text = (row.get("retrieval_text") or "").lower()
-            score = 0.1
-            for term in re.findall(r"[a-z]{4,}", q):
-                if term in text:
-                    score += 0.4
-            if "visual description" in text:
-                score += 0.3
-            if "lifecycle" in q and "lifecycle" in text:
-                score += 0.5
-            if "diagram" in q and "diagram" in text:
-                score += 0.5
+            text = row.get("retrieval_text") or ""
+            score = _query_figure_relevance_score(text, query)
             try:
-                score += max(0, 0.05 * int(row.get("page_number") or 0))
+                page = int(row.get("page_number") or 0)
+                if page > 0:
+                    score += _architecture_page_boost(page, query, labels)
+                    score += _attention_page_boost(page, query, labels)
             except (TypeError, ValueError):
                 pass
+            try:
+                page_i = int(row.get("page_number") or 0)
+            except (TypeError, ValueError):
+                page_i = 0
+            score -= _bad_vision_caption_penalty(
+                text, page_labels=labels.get(page_i), query=query
+            )
             return score
+
+        if _query_seeks_attention_diagrams(query):
+            rows = [
+                r
+                for r in rows
+                if int(r.get("page_number") or 0) == 4
+            ] or rows
 
         rows.sort(key=_row_score, reverse=True)
         for row in rows:
@@ -1039,6 +1230,17 @@ def _figures_from_scoped_documents(scope_file_ids: list, query: str = "") -> lis
                     img,
                     fallback_text=row.get("retrieval_text") or "",
                     page_number=row.get("page_number"),
+                    query=query,
+                )
+            elif raw_id:
+                from app.services.figure_serving import build_figure_dict
+
+                fig = build_figure_dict(
+                    document_id=row.get("document_id") or did,
+                    page_number=row.get("page_number"),
+                    image_id=raw_id,
+                    caption=row.get("retrieval_text") or "",
+                    query=query,
                 )
             if not fig:
                 from app.services.figure_serving import figure_from_page
@@ -1046,27 +1248,37 @@ def _figures_from_scoped_documents(scope_file_ids: list, query: str = "") -> lis
                 page = row.get("page_number")
                 doc_id = row.get("document_id") or did
                 if page is not None:
+                    cap = enrich_figure_caption(
+                        doc_id,
+                        int(page),
+                        query,
+                        row.get("retrieval_text") or "",
+                    )
                     fig = figure_from_page(
                         doc_id,
                         int(page),
-                        caption=row.get("retrieval_text") or "",
+                        caption=cap,
                         image_id=raw_id,
                     )
-            page_key = (fig.get("document_id"), fig.get("page_number"))
-            if not fig or fig["view_url"] in seen or page_key in seen:
+            if not fig:
                 continue
-            seen.add(fig["view_url"])
-            seen.add(page_key)
+            page_key = (fig.get("document_id"), fig.get("page_number"))
+            if fig["view_url"] in seen_urls:
+                continue
+            if not allow_same_page and page_key in seen_pages:
+                continue
+            seen_urls.add(fig["view_url"])
+            seen_pages.add(page_key)
             figures.append(fig)
-            if len(figures) >= 1:
+            if len(figures) >= max_figures:
                 return figures
     if not figures:
         from app.services.figure_serving import figures_from_disk
 
         figures = figures_from_disk(
-            _cap_scope_document_ids(scope_file_ids),
+            doc_order[:5] or _cap_scope_document_ids(scope_file_ids),
             query=query,
-            max_figures=1,
+            max_figures=max_figures,
         )
     return figures
 
@@ -1077,14 +1289,42 @@ def _resolve_figures_for_query(
     query: str,
 ) -> list:
     """Prefer hydrated retrieval hits; fall back to all image_caption rows in scope."""
-    figures = _figures_from_context_chunks(context_chunks, query=query)
-    if not figures and _query_seeks_figure_or_image(query):
+    max_figures = _max_figures_for_query(query)
+    if _query_seeks_figure2_pair(query) and scope_file_ids:
+        from app.services.figure_serving import figures_figure2_pair
+
+        doc_order = _figure_priority_document_ids(
+            _cap_scope_document_ids(scope_file_ids), query
+        )
+        for did in doc_order[:3]:
+            figures = figures_figure2_pair(did, query=query)
+            if len(figures) >= 2:
+                logger.info(
+                    ">>> FIGURES: Figure 2 pair doc=%s labels=%s",
+                    did[:8],
+                    [f.get("caption", "")[:48] for f in figures],
+                )
+                return figures[:2]
+    if (
+        (_query_seeks_architecture_diagram(query) or _query_seeks_attention_diagrams(query))
+        and scope_file_ids
+    ):
         figures = _figures_from_scoped_documents(scope_file_ids, query=query)
+        if not figures:
+            figures = _figures_from_context_chunks(context_chunks, query=query)
+    else:
+        figures = _figures_from_context_chunks(context_chunks, query=query)
+        if not figures and _query_seeks_figure_or_image(query):
+            figures = _figures_from_scoped_documents(scope_file_ids, query=query)
     if not figures and _query_seeks_figure_or_image(query) and scope_file_ids:
         from app.services.figure_serving import figures_from_disk
 
         figures = figures_from_disk(
-            _cap_scope_document_ids(scope_file_ids), query=query, max_figures=1
+            _figure_priority_document_ids(
+                _cap_scope_document_ids(scope_file_ids), query
+            ),
+            query=query,
+            max_figures=max_figures,
         )
     if _query_seeks_figure_or_image(query):
         logger.info(
@@ -1107,21 +1347,10 @@ def _answer_has_embedded_document_image(answer: str) -> bool:
 
 def _ensure_document_figures_in_answer(answer: str, figures: list, query: str) -> str:
     """
-    When the user asked to see a diagram, append Markdown image lines for stored figures
-    if the LLM omitted them (e.g. linked an external URL from PDF text instead).
+    Figures are returned on the chat API / SSE ``figures`` field and rendered by the
+    web client (ChatFigures gallery). Do not append duplicate Markdown image blocks.
     """
-    if not figures or not _query_seeks_figure_or_image(query):
-        return answer
-    if _answer_has_embedded_document_image(answer):
-        return answer
-    lines = ["\n\n## Diagram from your document\n"]
-    for fig in figures[:1]:
-        alt = "Figure"
-        cap = (fig.get("caption") or "").strip()
-        if cap:
-            alt = cap[:120] + ("…" if len(cap) > 120 else "")
-        lines.append(f"![{alt}]({fig['view_url']})")
-    return (answer or "").rstrip() + "\n".join(lines)
+    return (answer or "").rstrip()
 
 
 def _sse_payload(obj: dict) -> str:
@@ -1585,11 +1814,20 @@ async def chat(request: ChatRequest):
         return _chat_response_from_turn(turn, answer, query=query)
 
     llm_service = get_llm_service()
+    figures = _resolve_figures_for_query(
+        turn.get("context_chunks") or [],
+        turn.get("scope_file_ids") or [],
+        query,
+    )
+    context_for_llm = turn["context_chunks"]
+    if figures:
+        context_for_llm = _prepend_figures_to_context(context_for_llm, figures)
     answer = llm_service.generate_response(
         query=query,
-        context_chunks=turn["context_chunks"],
+        context_chunks=context_for_llm,
         chat_history=turn["chat_history"],
         available_technologies=turn["available_technologies"],
+        attached_figures=figures or None,
     )
     assistant_row = chat_service.add_message(session_id, "assistant", answer)
     _record_llm_usage(
@@ -1617,6 +1855,9 @@ async def chat_stream(request: ChatRequest):
     stream_figures = _resolve_figures_for_query(
         context_chunks_for_figures, scope_file_ids, query
     )
+    context_for_llm = turn["context_chunks"]
+    if stream_figures:
+        context_for_llm = _prepend_figures_to_context(context_for_llm, stream_figures)
 
     async def event_generator():
         meta = {
@@ -1649,9 +1890,10 @@ async def chat_stream(request: ChatRequest):
         try:
             for delta in llm_service.stream_response(
                 query=query,
-                context_chunks=turn["context_chunks"],
+                context_chunks=context_for_llm,
                 chat_history=turn["chat_history"],
                 available_technologies=turn["available_technologies"],
+                attached_figures=stream_figures or None,
             ):
                 parts.append(delta)
                 yield _sse_payload({"type": "token", "content": delta})

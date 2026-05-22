@@ -288,40 +288,75 @@ def object_exists(object_key: str) -> bool:
     return download_bytes(key) is not None
 
 
+def list_image_keys(document_id: str) -> List[str]:
+    """List object keys under ``{document_id}/images/`` in Supabase Storage."""
+    if not storage_enabled():
+        return []
+    prefix = f"{document_id}/images"
+    keys: List[str] = []
+    try:
+        for item in _storage().list(prefix) or []:
+            name = (item.get("name") or "").strip()
+            if name and "." in name:
+                keys.append(f"{prefix}/{name}")
+    except Exception as e:
+        logger.debug("blob_storage: list_image_keys %s: %s", prefix, e)
+    return sorted(keys)
+
+
 def list_objects_under(prefix: str) -> List[str]:
+    """List files under a storage prefix (e.g. ``{document_id}/images``)."""
     if not storage_enabled():
         return []
     base = prefix.strip().strip("/")
+    parts = base.split("/")
+    if parts and parts[-1] == "images":
+        doc_id = "/".join(parts[:-1]) if len(parts) > 1 else (parts[0] if parts else "")
+        if doc_id:
+            return list_image_keys(doc_id)
     keys: List[str] = []
-
-    def _walk(folder: str) -> None:
-        try:
-            items = _storage().list(folder) or []
-        except Exception as e:
-            logger.debug("blob_storage: list %s: %s", folder, e)
-            return
-        for item in items:
-            name = item.get("name") or ""
-            if not name:
-                continue
-            full = f"{folder}/{name}" if folder else name
-            meta = item.get("metadata") or {}
-            if meta.get("size") is None and not str(name).count("."):
-                _walk(full)
-            else:
-                keys.append(full)
-
-    _walk(base)
+    try:
+        for item in _storage().list(base) or []:
+            name = (item.get("name") or "").strip()
+            if name and "." in name:
+                keys.append(f"{base}/{name}")
+    except Exception as e:
+        logger.debug("blob_storage: list_objects_under %s: %s", base, e)
     return keys
 
 
-def find_page_image_key(document_id: str, page_number: int) -> Optional[str]:
-    prefix = f"{document_id}/images"
-    for pattern in (f"page_{page_number}_", f"page_{int(page_number)}_"):
-        for key in list_objects_under(prefix):
-            if pattern in Path(key).name:
+def find_page_image_key(
+    document_id: str,
+    page_number: int,
+    *,
+    basename: Optional[str] = None,
+) -> Optional[str]:
+    """Match ``page_{N}_*.png`` in Storage; prefer exact ``basename`` when given."""
+    try:
+        page = int(page_number)
+    except (TypeError, ValueError):
+        return None
+    if page <= 0:
+        return None
+    keys = list_image_keys(document_id)
+    if basename:
+        bn = Path(basename.replace("\\", "/")).name
+        for key in keys:
+            if Path(key).name == bn:
                 return key
+    for key in keys:
+        if Path(key).name.startswith(f"page_{page}_"):
+            return key
     return None
+
+
+def _media_type_for_filename(name: str) -> str:
+    ext = Path(name).suffix.lower()
+    if ext == ".png":
+        return "image/png"
+    if ext in (".jpg", ".jpeg"):
+        return "image/jpeg"
+    return "application/octet-stream"
 
 
 def page_image_available(document_id: str, page_number: int) -> bool:
@@ -484,27 +519,216 @@ def resolve_image_path_for_serving(
 ) -> Optional[Path]:
     """Local path for serving an image (disk or temp download from storage)."""
     if image_path_or_key:
-        if is_storage_object_key(image_path_or_key):
-            return download_to_temp_file(image_path_or_key)
+        path_norm = str(image_path_or_key).strip().replace("\\", "/")
+        if is_storage_object_key(path_norm):
+            return download_to_temp_file(path_norm)
+        fname = Path(path_norm).name
+        if fname.startswith("page_"):
+            if storage_enabled():
+                key = find_page_image_key(
+                    document_id, _page_from_filename(fname), basename=fname
+                ) or image_object_key(document_id, fname)
+                tmp = download_to_temp_file(key)
+                if tmp:
+                    return tmp
+            local = find_disk_page_image_local(
+                document_id, _page_from_filename(fname)
+            )
+            if local:
+                return local
         p = Path(image_path_or_key)
         if p.is_file():
             return p
-        fname = p.name
-        if fname.startswith("page_"):
-            local = find_disk_page_image_local(document_id, _page_from_filename(fname))
+    if page_number is not None:
+        try:
+            page_i = int(page_number)
+        except (TypeError, ValueError):
+            page_i = -1
+        if page_i > 0:
+            if storage_enabled():
+                key = find_page_image_key(document_id, page_i)
+                if key:
+                    tmp = download_to_temp_file(key)
+                    if tmp:
+                        return tmp
+            local = find_disk_page_image_local(document_id, page_i)
             if local:
                 return local
+    return None
+
+
+def storage_key_for_raw_image_id(document_id: str, image_id: str) -> Optional[str]:
+    """
+    Map ``raw_images.image_id`` (UUID) to the exact Storage object ``page_{N}_{idx}.png``.
+
+    When ``raw_images`` rows are missing, align image_caption chunks on the same PDF page
+    (sorted by chunk_id) with sorted ``page_{N}_*.png`` keys so two crops on page 4 do not
+    both resolve to ``page_4_0.png``.
+    """
+    import json
+
+    from app.services.chunk_store import get_chunk_store
+    from app.services.raw_block_store import get_raw_block_store
+
+    did = (document_id or "").strip()
+    iid = (image_id or "").strip()
+    if not did or not iid:
+        return None
+
+    row = get_raw_block_store().get_image(iid)
+    if row:
+        path_str = (row.get("image_path") or "").strip().replace("\\", "/")
+        if path_str:
+            if is_storage_object_key(path_str):
+                return path_str
+            bn = Path(path_str).name
+            if bn.startswith("page_") and storage_enabled():
+                key = find_page_image_key(
+                    did, _page_from_filename(bn), basename=bn
+                )
+                if key:
+                    return key
+
+    by_page: Dict[int, List[tuple]] = {}
+    try:
+        chunks = get_chunk_store().list_chunks_by_type(did, "image_caption", limit=80)
+    except Exception:
+        chunks = []
+    for ch in chunks:
+        try:
+            meta = json.loads(ch.get("metadata_json") or "{}")
+        except Exception:
+            meta = {}
+        rid = (meta.get("raw_image_id") or "").strip()
+        if not rid:
+            continue
+        try:
+            page = int(ch.get("page_number") or 0)
+        except (TypeError, ValueError):
+            continue
+        if page < 1:
+            continue
+        cid = str(ch.get("chunk_id") or "")
+        by_page.setdefault(page, []).append((cid, rid))
+
+    for page, pairs in by_page.items():
+        pairs.sort(key=lambda x: x[0])
+        rids = [r for _, r in pairs]
+        if iid not in rids:
+            continue
+        idx = rids.index(iid)
+        page_keys = sorted(
+            k
+            for k in list_image_keys(did)
+            if Path(k).name.startswith(f"page_{page}_")
+        )
+        if idx < len(page_keys):
+            return page_keys[idx]
+    return None
+
+
+def resolve_image_bytes_for_serving(
+    document_id: str,
+    image_id: str,
+) -> Optional[tuple]:
+    """
+    Resolve image bytes for GET /documents/{id}/images/{image_id}.
+
+    Storage layout: ``{document_id}/images/page_{page}_{idx}.png``
+    DB ``raw_images.image_id`` is a UUID; ``image_path`` may be a local path from ingest.
+    """
+    from app.services.raw_block_store import get_raw_block_store
+
+    did = (document_id or "").strip()
+    iid = (image_id or "").strip()
+    if not did or not iid:
+        return None
+
+    key = storage_key_for_raw_image_id(did, iid)
+    if key and storage_enabled():
+        data = download_bytes(key)
+        if data:
+            name = Path(key).name
+            return data, _media_type_for_filename(name), name
+
+    row = get_raw_block_store().get_image(iid)
+    basename: Optional[str] = None
+    page: Optional[int] = None
+    if row:
+        page = row.get("page_number")
+        path_str = (row.get("image_path") or "").strip()
+        if path_str:
+            path_norm = path_str.replace("\\", "/")
+            basename = Path(path_norm).name
+            if is_storage_object_key(path_norm):
+                data = download_bytes(path_norm)
+                if data:
+                    return data, _media_type_for_filename(basename), basename
+            p = Path(path_str)
+            if p.is_file():
+                return p.read_bytes(), _media_type_for_filename(p.name), p.name
+            if basename.startswith("page_") and storage_enabled():
+                exact = find_page_image_key(
+                    did, _page_from_filename(basename), basename=basename
+                )
+                if exact:
+                    data = download_bytes(exact)
+                    if data:
+                        return data, _media_type_for_filename(basename), basename
+
+    if page is None:
+        try:
+            from app.services.chunk_store import get_chunk_store
+
+            for chunk in get_chunk_store().list_chunks_by_type(
+                did, "image_caption", limit=80
+            ):
+                meta: Dict[str, Any] = {}
+                try:
+                    import json
+
+                    meta = json.loads(chunk.get("metadata_json") or "{}")
+                except Exception:
+                    meta = {}
+                if meta.get("raw_image_id") != iid:
+                    continue
+                page = chunk.get("page_number")
+                break
+        except Exception:
+            pass
+
+    if page is not None:
+        try:
+            page_i = int(page)
+        except (TypeError, ValueError):
+            page_i = -1
+        if page_i > 0:
             if storage_enabled():
-                key = image_object_key(document_id, fname)
-                return download_to_temp_file(key)
-    if page_number is not None:
-        local = find_disk_page_image_local(document_id, page_number)
-        if local:
-            return local
-        if storage_enabled():
-            key = find_page_image_key(document_id, int(page_number))
-            if key:
-                return download_to_temp_file(key)
+                key = (
+                    storage_key_for_raw_image_id(did, iid)
+                    or find_page_image_key(did, page_i, basename=basename)
+                )
+                if key:
+                    data = download_bytes(key)
+                    if data:
+                        name = Path(key).name
+                        return data, _media_type_for_filename(name), name
+            local = find_disk_page_image_local(did, page_i)
+            if local:
+                return (
+                    local.read_bytes(),
+                    _media_type_for_filename(local.name),
+                    local.name,
+                )
+
+    logger.debug(
+        "blob_storage: no image bytes doc=%s image_id=%s page=%s basename=%s storage_keys=%s",
+        did[:8],
+        iid[:8],
+        page,
+        basename,
+        list_image_keys(did)[:5],
+    )
     return None
 
 

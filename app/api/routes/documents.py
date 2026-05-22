@@ -135,58 +135,58 @@ async def get_document_pdf(document_id: str):
 @router.get("/{document_id}/images/page/{page_number}")
 async def get_document_image_by_page(document_id: str, page_number: int):
     """
-    Serve a cropped figure by PDF page when raw_images row is missing but the
-    file exists under uploads/images/{document_id}/page_{N}_*.png.
+    Serve a cropped figure by PDF page (disk or Supabase Storage ``page_{N}_*.png``).
     """
-    from app.services.figure_serving import find_disk_page_image
+    from app.services.blob_storage import (
+        find_page_image_key,
+        download_bytes,
+        find_disk_page_image_local,
+        storage_enabled,
+        _media_type_for_filename,
+    )
 
-    path = find_disk_page_image(document_id, page_number)
-    if not path or not path.is_file():
+    data = None
+    filename = f"page_{page_number}.png"
+    if storage_enabled():
+        key = find_page_image_key(document_id, page_number)
+        if key:
+            data = download_bytes(key)
+            filename = Path(key).name
+    if not data:
+        local = find_disk_page_image_local(document_id, page_number)
+        if local and local.is_file():
+            data = local.read_bytes()
+            filename = local.name
+    if not data:
         raise HTTPException(
             status_code=404,
             detail=f"No extracted image for page {page_number}",
         )
-    upload_root = Path(settings.UPLOAD_DIR).resolve()
-    try:
-        path.resolve().relative_to(upload_root)
-    except ValueError:
-        raise HTTPException(status_code=403, detail="Invalid image path")
-    ext = path.suffix.lower()
-    media = (
-        "image/png"
-        if ext == ".png"
-        else "image/jpeg"
-        if ext in (".jpg", ".jpeg")
-        else "application/octet-stream"
+    return Response(
+        content=data,
+        media_type=_media_type_for_filename(filename),
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
     )
-    return FileResponse(path=str(path), media_type=media, filename=path.name)
 
 
 @router.get("/{document_id}/images/{image_id}")
 async def get_document_extracted_image(document_id: str, image_id: str):
     """
-    Serve a cropped figure saved during ingest (uploads/images/{document_id}/...).
-    Used by chat answers as ![caption](/documents/{document_id}/images/{image_id}).
-    """
-    from app.services.figure_serving import resolve_image_file_path
+    Serve a cropped figure by ``raw_images.image_id`` (UUID).
 
-    p = resolve_image_file_path(document_id, image_id)
-    if not p or not p.is_file():
+    Files in Storage are named ``page_{page}_{idx}.png``; this route maps UUID → page/file.
+    """
+    from app.services.blob_storage import resolve_image_bytes_for_serving
+
+    resolved = resolve_image_bytes_for_serving(document_id, image_id)
+    if not resolved:
         raise HTTPException(status_code=404, detail="Image not found for this document")
-    upload_root = Path(settings.UPLOAD_DIR).resolve()
-    try:
-        p.resolve().relative_to(upload_root)
-    except ValueError:
-        raise HTTPException(status_code=403, detail="Invalid image path")
-    ext = p.suffix.lower()
-    media = (
-        "image/png"
-        if ext == ".png"
-        else "image/jpeg"
-        if ext in (".jpg", ".jpeg")
-        else "application/octet-stream"
+    data, media_type, filename = resolved
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
     )
-    return FileResponse(path=str(p), media_type=media, filename=p.name)
 
 
 @router.post("/{document_id}/replace", response_model=UploadResponse)

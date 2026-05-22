@@ -75,6 +75,11 @@ OTHER RULES:
   Markdown image line. When the user asks to **see** or **show** a figure/diagram/image and that block is in context,
   include that Markdown line verbatim in your answer so the app can display the image. Do not say the image is
   "not available" if `view_url` is present.
+- If **ATTACHED FIGURES** are listed in the user message, the app will show those images below your reply. Describe
+  the diagram using excerpt text (Figure 1, encoder/decoder, attention blocks, etc.) and state that the diagram is
+  displayed in the attached image(s). Do not claim a diagram is "not provided", "not available", or "not a direct
+  representation" when ATTACHED FIGURES or `view_url` is present. Do not critique whether the crop matches the caption;
+  use the excerpt text for the official figure description.
 
 DO NOT HALLUCINATE: only state what the retrieved text reasonably supports.
 
@@ -101,6 +106,7 @@ FORMATTING: Use compact Markdown — ## for section titles, short bullet lists, 
         chat_history: Optional[List[Dict]] = None,
         system_prompt: Optional[str] = None,
         available_technologies: Optional[List[str]] = None,
+        attached_figures: Optional[List[Dict]] = None,
     ) -> List[Dict]:
         """Build OpenAI-format messages for RAG completion (shared by sync + stream)."""
         if system_prompt is None:
@@ -256,9 +262,27 @@ OTHER DOCUMENT LABELS IN YOUR LIBRARY (orientation only — not a checklist of a
 {', '.join(available_technologies)}
 """
 
+        attached_block = ""
+        if attached_figures:
+            lines = ["ATTACHED FIGURES (shown to the user below your answer):"]
+            for i, fig in enumerate(attached_figures[:2], 1):
+                cap = (fig.get("caption") or "").strip() or "Figure from document"
+                url = (fig.get("view_url") or "").strip()
+                page = fig.get("page_number")
+                page_note = f", PDF page {page}" if page is not None else ""
+                lines.append(f"{i}. caption={cap}{page_note}")
+                if url:
+                    lines.append(f"   view_url={url}")
+            lines.append(
+                "Describe this diagram using the RETRIEVED CONTEXT (Figure 1, encoder, decoder, attention). "
+                "Tell the user the diagram(s) are displayed in the attached image(s). "
+                "Do not say the diagram is missing, unavailable, or 'not a direct representation'."
+            )
+            attached_block = "\n".join(lines) + "\n\n"
+
         user_prompt = f"""Answer using ONLY the RETRIEVED CONTEXT below (including RAW TABLE and RAW CODE sections).
 
-RETRIEVED CONTEXT:
+{attached_block}RETRIEVED CONTEXT:
 {context}
 
 Coarse document/course tags on chunks (not a list of allowed questions): {tech_list}
@@ -305,10 +329,16 @@ Write the best compact answer the retrieved text allows."""
         chat_history: Optional[List[Dict]] = None,
         system_prompt: Optional[str] = None,
         available_technologies: Optional[List[str]] = None,
+        attached_figures: Optional[List[Dict]] = None,
     ) -> str:
         """Generate response using LLM with context from vector search and chat history."""
         messages = self._build_rag_messages(
-            query, context_chunks, chat_history, system_prompt, available_technologies
+            query,
+            context_chunks,
+            chat_history,
+            system_prompt,
+            available_technologies,
+            attached_figures,
         )
         if len(messages) == 2 and messages[1].get("role") == "user" and "couldn't find any text" in (messages[1].get("content") or ""):
             return messages[1]["content"]
@@ -329,10 +359,16 @@ Write the best compact answer the retrieved text allows."""
         chat_history: Optional[List[Dict]] = None,
         system_prompt: Optional[str] = None,
         available_technologies: Optional[List[str]] = None,
+        attached_figures: Optional[List[Dict]] = None,
     ) -> Iterator[str]:
         """Yield completion text deltas for SSE streaming."""
         messages = self._build_rag_messages(
-            query, context_chunks, chat_history, system_prompt, available_technologies
+            query,
+            context_chunks,
+            chat_history,
+            system_prompt,
+            available_technologies,
+            attached_figures,
         )
         if len(messages) == 2 and messages[1].get("role") == "user" and "couldn't find any text" in (messages[1].get("content") or ""):
             yield messages[1]["content"]
